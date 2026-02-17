@@ -27,9 +27,9 @@ switch that directly controls the physical relay:
   - State ON  = relay energised (circuit closed)
   - State OFF = relay de-energised (circuit open)
 
-BLE connections are persistent: a ShyionConnection maintains a long-lived
-BLE link to each known device.  Relay state is polled every 15 minutes
-and commands are dispatched over the held connection.
+BLE connections are transient: each poll or toggle opens a fresh
+connection, performs the operation, and disconnects.  State is polled
+once per hour; toggles connect on-demand.
 
 Devices from config.ini are loaded at startup.  The discovery scan finds
 new devices that are not yet in the config.
@@ -70,12 +70,13 @@ from settingsdevice import SettingsDevice  # noqa: E402
 
 from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
 from shyion_ble import (  # noqa: E402
-    ShyionConnection,
+    poll_relay_state,
+    toggle_relay,
     scan_for_relays,
     DiscoveredRelay,
 )
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,7 +87,7 @@ logger = logging.getLogger("dbus-shyion-switch")
 
 # Defaults
 DEFAULT_SCAN_INTERVAL = 60
-DEFAULT_POLL_INTERVAL_MINUTES = 15
+DEFAULT_POLL_INTERVAL_MINUTES = 60
 
 # Status codes for SwitchableOutput (per Venus OS switch API)
 STATUS_OFF = 0x00          # Relay off
@@ -156,9 +157,9 @@ class ShyionSwitchService:
     Discovers devices via BLE scanning and/or config.ini.  Each relay
     appears as a toggleable switch in the Venus OS GUI.
 
-    BLE connections are persistent: a ShyionConnection maintains the link
-    for each device.  Relay state is polled every 15 minutes and toggling
-    sends commands over the held connection.
+    BLE connections are transient: each toggle or poll opens a fresh
+    connection, sends the command, reads the state, and disconnects.
+    State is polled once per hour.
     """
 
     def __init__(self):
@@ -190,7 +191,6 @@ class ShyionSwitchService:
         # Per-device state
         self._device_info: dict[str, DiscoveredRelay] = {}
         self._last_known_state: dict[str, bool | None] = {}
-        self._connections: dict[str, ShyionConnection] = {}
 
         # Scanning state
         self._scan_timer_id = None
@@ -272,9 +272,6 @@ class ShyionSwitchService:
         # Restore previously discovered devices from settings
         self._restore_devices_from_settings()
 
-        # Start persistent connections for all known devices
-        self._start_all_connections()
-
         # Restore discovery state
         discovery_state = self._settings["DiscoveryEnabled"]
         self._dbusservice["/SwitchableOutput/relay_discovery/State"] = discovery_state
@@ -316,45 +313,7 @@ class ShyionSwitchService:
                 logger.debug("Restored relay state for %s: %s",
                              mac_id, "ON" if rs else "OFF")
         except Exception:
-            pass  # Setting doesn't exist yet
-
-    # ── Connection lifecycle ─────────────────────────────────────────────
-
-    def _start_all_connections(self):
-        """Start persistent BLE connections for all known devices."""
-        for mac_id, dev_info in self._device_info.items():
-            self._ensure_connection(mac_id)
-
-    def _ensure_connection(self, mac_id: str) -> ShyionConnection | None:
-        """Ensure a persistent BLE connection exists for a device.
-
-        If the connection already exists, returns it.  Otherwise creates
-        a new ShyionConnection and stores it.
-        """
-        if mac_id in self._connections:
-            return self._connections[mac_id]
-
-        if mac_id not in self._device_info:
-            return None
-
-        mac_address = self._device_info[mac_id].mac
-        logger.info("Starting persistent connection for %s (%s)",
-                     self._get_device_name(mac_id), mac_address)
-
-        conn = ShyionConnection(
-            address=mac_address,
-            lock_config=self._lock_config,
-            scan_lock_config=self._scan_lock_config,
-        )
-        self._connections[mac_id] = conn
-        return conn
-
-    def _stop_connection(self, mac_id: str):
-        """Stop and remove the persistent connection for a device."""
-        conn = self._connections.pop(mac_id, None)
-        if conn is not None:
-            logger.info("Stopping connection for %s", mac_id)
-            conn.stop()
+            pass
 
     # ── Discovery callbacks ─────────────────────────────────────────────────
 
@@ -433,9 +392,6 @@ class ShyionSwitchService:
             self._create_device_switch(mac_id, device.name)
             self._save_device_to_settings(mac_id, device.name, device.mac)
 
-            # Start persistent connection for newly discovered device
-            self._ensure_connection(mac_id)
-
         return False
 
     # ── Per-device switch management ────────────────────────────────────────
@@ -496,7 +452,6 @@ class ShyionSwitchService:
         name = self._get_device_name(mac_id)
         logger.info("Toggle '%s' (%s) -> %s", name, mac_id, "ON" if on else "OFF")
 
-        # Dispatch via persistent connection in background thread
         thread = threading.Thread(
             target=self._run_toggle_relay,
             args=(mac_id, on),
@@ -518,19 +473,20 @@ class ShyionSwitchService:
     # ── BLE relay toggle (runs in background thread) ─────────────────────
 
     def _run_toggle_relay(self, mac_id: str, on: bool):
-        """Use the persistent connection to set relay state."""
-        conn = self._connections.get(mac_id)
-        if conn is None:
-            logger.warning("[%s] No connection available for toggle", mac_id)
+        """Transient session: connect, set relay, read state, disconnect."""
+        if mac_id not in self._device_info:
+            logger.warning("[%s] Unknown device for toggle", mac_id)
             GLib.idle_add(self._apply_relay_result, mac_id, None)
             return
 
-        # Wait briefly for the connection to come up if it's still connecting
-        if not conn.is_connected:
-            logger.info("[%s] Waiting for connection...", mac_id)
-            conn._connected.wait(timeout=30.0)
-
-        result = conn.set_relay(on, timeout=20.0)
+        address = self._device_info[mac_id].mac
+        result = asyncio.run(
+            toggle_relay(
+                address, on,
+                lock_config=self._lock_config,
+                scan_lock_config=self._scan_lock_config,
+            )
+        )
         GLib.idle_add(self._apply_relay_result, mac_id, result)
 
     def _apply_relay_result(self, mac_id: str, state: bool | None) -> bool:
@@ -600,22 +556,23 @@ class ShyionSwitchService:
         return True
 
     def _run_poll_all_devices(self):
-        """Background thread: poll each device sequentially via persistent connections."""
+        """Background thread: poll each device sequentially (one at a time)."""
         for mac_id in list(self._device_info.keys()):
             self._run_poll_device(mac_id)
 
     def _run_poll_device(self, mac_id: str):
-        """Poll a single device via its persistent connection."""
-        conn = self._connections.get(mac_id)
-        if conn is None:
-            logger.debug("[%s] No connection for poll, skipping", mac_id)
+        """Transient session: connect, query state, disconnect."""
+        if mac_id not in self._device_info:
             return
 
-        if not conn.is_connected:
-            logger.debug("[%s] Not connected for poll, skipping", mac_id)
-            return
-
-        state = conn.get_relay_state(timeout=15.0)
+        address = self._device_info[mac_id].mac
+        state = asyncio.run(
+            poll_relay_state(
+                address,
+                lock_config=self._lock_config,
+                scan_lock_config=self._scan_lock_config,
+            )
+        )
         GLib.idle_add(self._apply_poll_result, mac_id, state)
 
     def _apply_poll_result(self, mac_id: str, state: bool | None) -> bool:
@@ -769,16 +726,12 @@ class ShyionSwitchService:
     # ── Shutdown ────────────────────────────────────────────────────────────
 
     def stop(self):
-        """Clean shutdown: stop scanning, stop connections, cancel timers."""
+        """Clean shutdown: stop scanning, cancel timers."""
         self._stop_scanning()
 
         if self._poll_timer_id is not None:
             GLib.source_remove(self._poll_timer_id)
             self._poll_timer_id = None
-
-        # Stop all persistent connections
-        for mac_id in list(self._connections.keys()):
-            self._stop_connection(mac_id)
 
         logger.info("Service stopped")
 
