@@ -59,9 +59,10 @@ from bleak_connection_manager import (
     LockConfig,
     ScanLockConfig,
     establish_connection,
+    discover_adapters,
     managed_discover,
     managed_find_device,
-    validate_gatt_services,
+    validate_char_exists,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,8 @@ class ShyionSession:
         self._response_event: asyncio.Event | None = None
 
     async def __aenter__(self) -> ShyionSession:
-        escalation = EscalationPolicy([], config=EscalationConfig(reset_adapter=False))
+        adapters = discover_adapters()
+        escalation = EscalationPolicy(adapters, config=EscalationConfig(reset_adapter=False))
 
         # Step 1: Find the device
         logger.info("[%s] Scanning...", self._address)
@@ -271,7 +273,7 @@ class ShyionSession:
             max_attempts=4,
             close_inactive_connections=True,
             try_direct_first=True,
-            validate_connection=validate_gatt_services,
+            validate_connection=validate_char_exists(SPP_NOTIFY),
             lock_config=self._lock_config,
             escalation_policy=escalation,
             overall_timeout=300.0,
