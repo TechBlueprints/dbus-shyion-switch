@@ -20,13 +20,13 @@ These devices use the Telink TLSR8266 chipset and communicate via a custom
 serial-port-profile (SPP) protocol over BLE GATT.  The protocol uses:
 
   - Custom Telink service UUID:  00010203-0405-0607-0809-0a0b0c0d1910
-  - Notify characteristic (2b10): device → host responses
-  - Write  characteristic (2b11): host → device commands (write-without-response)
+  - Notify characteristic (2b10): device -> host responses
+  - Write  characteristic (2b11): host -> device commands (write-without-response)
 
 Framing:
   - Start marker:  0x6E
   - End marker:    0x6F
-  - Escape byte:   0x6D  (followed by 0x4D→0x6D, 0x4E→0x6E, 0x4F→0x6F)
+  - Escape byte:   0x6D  (followed by 0x4D->0x6D, 0x4E->0x6E, 0x4F->0x6F)
   - Checksum:      XOR of all payload bytes, appended before escaping
   - Frame:         [0x6E] [escaped(payload + xor)] [0x6F]
 
@@ -40,30 +40,32 @@ Status values in getDeviceStatus response:
   - 0x00 = relay OFF
 
 Response to setDeviceStatus is 7 bytes on success; last byte 0x00 = OK.
+
+Connection model: transient sessions (connect, command, disconnect).
+Uses bleak-connection-manager for all BLE operations.
 """
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
-import subprocess
-import time as _time
 from dataclasses import dataclass
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
+
+from bleak_connection_manager import (
+    EscalationConfig,
+    EscalationPolicy,
+    LockConfig,
+    ScanLockConfig,
+    establish_connection,
+    discover_adapters,
+    managed_discover,
+    managed_find_device,
+    validate_char_exists,
+)
 
 logger = logging.getLogger(__name__)
-
-# Cross-process lock shared with dbus-serialbattery to prevent
-# simultaneous BLE scans that trigger BlueZ "InProgress" errors.
-_BLE_CONNECT_LOCK_PATH = "/tmp/dbus-serialbattery-ble-connect.lock"
-
-# Module-level adapter reset tracking (shared across all sessions)
-_consecutive_connect_failures = 0
-_last_adapter_reset_time = 0.0
-_ADAPTER_RESET_THRESHOLD = 7
-_ADAPTER_RESET_COOLDOWN = 300.0  # 5 minutes
 
 # ── Telink SPP UUIDs ──────────────────────────────────────────────────────────
 
@@ -179,523 +181,132 @@ class DiscoveredRelay:
 
 
 async def scan_for_relays(
-    adapters: list[str] | None = None,
     timeout: float = 12.0,
+    scan_lock_config: ScanLockConfig | None = None,
 ) -> list[DiscoveredRelay]:
-    """Scan BLE for BBKS relay devices on the given adapters.
+    """Scan BLE for BBKS relay devices.
 
-    Acquires the cross-process BLE lock to avoid InProgress conflicts
-    with dbus-serialbattery.
+    Uses bleak-connection-manager's managed_discover for automatic
+    adapter rotation, scan locking, and InProgress retry.
     """
-    if adapters is None:
-        adapters = [""]
+    if scan_lock_config is None:
+        scan_lock_config = ScanLockConfig(enabled=True)
+
+    devices = await managed_discover(
+        timeout=timeout,
+        scan_lock_config=scan_lock_config,
+    )
 
     found: dict[str, DiscoveredRelay] = {}
+    for device in devices:
+        name = device.name or ""
+        if not name.upper().startswith(BBKS_NAME_PREFIX):
+            continue
 
-    # Acquire cross-process lock
-    lock_fd = None
-    lock_acquired = False
-    try:
-        lock_fd = open(_BLE_CONNECT_LOCK_PATH, "w")
-        lock_timeout = _time.time() + 15.0
-        while _time.time() < lock_timeout:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                lock_acquired = True
-                break
-            except (IOError, OSError):
-                await asyncio.sleep(0.5)
-    except Exception:
-        pass
-
-    try:
-        for adapter in adapters:
-            try:
-                kwargs = {}
-                if adapter:
-                    kwargs["adapter"] = adapter
-
-                scanner = BleakScanner(**kwargs)
-                await scanner.start()
-                await asyncio.sleep(timeout)
-                await scanner.stop()
-
-                for device, adv in scanner.discovered_devices_and_advertisement_data.values():
-                    name = device.name or ""
-                    if not name.upper().startswith(BBKS_NAME_PREFIX):
-                        continue
-
-                    mac = device.address.upper()
-                    if mac not in found:
-                        found[mac] = DiscoveredRelay(
-                            mac=mac,
-                            name=name,
-                            rssi=adv.rssi,
-                            model=name,
-                        )
-                        logger.info(
-                            "Discovered %s (%s) RSSI=%d on %s",
-                            name, mac, adv.rssi, adapter or "default",
-                        )
-
-            except Exception:
-                logger.exception("BLE scan failed on adapter %s", adapter or "default")
-    finally:
-        if lock_fd is not None:
-            try:
-                if lock_acquired:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                lock_fd.close()
-            except Exception:
-                pass
+        mac = device.address.upper()
+        if mac not in found:
+            found[mac] = DiscoveredRelay(
+                mac=mac,
+                name=name,
+                rssi=getattr(device, "rssi", -100),
+                model=name,
+            )
+            logger.info(
+                "Discovered %s (%s) on scan", name, mac,
+            )
 
     return list(found.values())
 
 
-# ── Session-based BLE client ──────────────────────────────────────────────────
+# ── Transient BLE session ────────────────────────────────────────────────────
 
 class ShyionSession:
-    """Transactional BLE session for a single Shyion BBKS relay device.
+    """Transient BLE session to a Shyion BBKS relay device.
 
-    Connects on demand, sends commands, and disconnects when no longer needed.
-    All methods are async and must be called from an asyncio event loop.
+    Connects to the device on entry, disconnects on exit.  All BLE
+    operations happen within the session context.
 
     Usage::
 
-        session = ShyionSession("A4:C1:38:9E:01:FC")
-        await session.connect()
-        state = await session.get_relay_state()
-        await session.set_relay(True)
-        await session.disconnect()
+        async with ShyionSession(address, lock_config, scan_lock_config) as s:
+            state = await s.get_relay_state()
+            confirmed = await s.set_relay(True)
     """
 
-    def __init__(self, address: str, adapter: str = ""):
+    def __init__(
+        self,
+        address: str,
+        lock_config: LockConfig | None = None,
+        scan_lock_config: ScanLockConfig | None = None,
+    ):
         self._address = address
-        self._adapter = adapter
+        self._lock_config = lock_config or LockConfig(enabled=True)
+        self._scan_lock_config = scan_lock_config or ScanLockConfig(enabled=True)
         self._client: BleakClient | None = None
         self._response: bytes | None = None
-        self._response_event = asyncio.Event()
+        self._response_event: asyncio.Event | None = None
 
-    @property
-    def is_connected(self) -> bool:
-        return self._client is not None and self._client.is_connected
+    async def __aenter__(self) -> ShyionSession:
+        adapters = discover_adapters()
+        escalation = EscalationPolicy(adapters, config=EscalationConfig(reset_adapter=False))
 
-    # ── Connection management ─────────────────────────────────────────────
+        # Step 1: Find the device
+        logger.info("[%s] Scanning...", self._address)
+        device = await managed_find_device(
+            self._address,
+            timeout=15.0,
+            max_attempts=3,
+            scan_lock_config=self._scan_lock_config,
+        )
 
-    async def connect(self, adapters: list[str] | None = None) -> bool:
-        """Scan for the device, clean up stale BlueZ state, and connect.
+        if device is None:
+            raise ConnectionError(
+                f"[{self._address}] Device not found after scanning"
+            )
 
-        Incorporates lessons from dbus-serialbattery:
-        - Cross-process file lock to avoid BlueZ InProgress errors
-        - Phantom connection detection and cleanup
-        - HCI LE_Create_Connection_Cancel for stuck pending connections
-        - start_notify with timeout
-        - GATT service resolution check
-        - Adapter rotation on InProgress with escalating delays
-        - Adapter reset after persistent failures
+        # Step 2: Connect via BCM
+        logger.info("[%s] Connecting...", self._address)
+        self._client = await establish_connection(
+            BleakClient,
+            device,
+            "Shyion %s" % self._address,
+            max_attempts=4,
+            close_inactive_connections=True,
+            try_direct_first=True,
+            validate_connection=validate_char_exists(SPP_NOTIFY),
+            lock_config=self._lock_config,
+            escalation_policy=escalation,
+            overall_timeout=300.0,
+        )
 
-        Returns True on success, False on failure.
-        """
-        global _consecutive_connect_failures, _last_adapter_reset_time
+        logger.info("[%s] Connected (MTU: %d)", self._address, self._client.mtu_size)
 
-        if self.is_connected:
-            return True
+        # Step 3: Set up notifications
+        await asyncio.wait_for(
+            self._setup_notifications(), timeout=5.0
+        )
 
-        if adapters is None:
-            if self._adapter:
-                adapters = [self._adapter]
-            else:
-                adapters = ["hci0", "hci1"]
+        return self
 
-        # ── Acquire cross-process BLE lock ────────────────────────────
-        lock_fd = None
-        lock_acquired = False
-        logger.debug("[%s] Acquiring BLE lock...", self._address)
-        try:
-            lock_fd = open(_BLE_CONNECT_LOCK_PATH, "w")
-            lock_timeout = _time.time() + 15.0
-            while _time.time() < lock_timeout:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    lock_acquired = True
-                    break
-                except (IOError, OSError):
-                    await asyncio.sleep(0.5)
-            if not lock_acquired:
-                logger.warning("[%s] BLE lock timeout after 15s, proceeding",
-                               self._address)
-            else:
-                logger.debug("[%s] BLE lock acquired", self._address)
-        except Exception as e:
-            logger.warning("[%s] BLE lock unavailable: %s", self._address, e)
-
-        try:
-            return await self._connect_inner(adapters)
-        finally:
-            # Release lock
-            if lock_fd is not None:
-                try:
-                    if lock_acquired:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    lock_fd.close()
-                except Exception:
-                    pass
-
-    async def _connect_inner(self, adapters: list[str]) -> bool:
-        """Core connection logic (called while holding the BLE lock).
-
-        Strategy:
-        1. Try direct connect (no scan) on each adapter — fast, works if
-           BlueZ has the device cached from a prior scan.
-        2. If direct connect fails, do phantom cleanup then try targeted
-           scan + connect on each adapter.
-        3. If all fail, escalate (BlueZ state clear, adapter reset).
-        """
-        global _consecutive_connect_failures, _last_adapter_reset_time
-
-        inprogress_failures = 0
-
-        # ── Phase 1: Direct connect (no scan overhead) ────────────────
-        for adapter in adapters:
-            adapter_name = adapter or "default"
-            try:
-                logger.info("[%s] Direct connect on %s...",
-                            self._address, adapter_name)
-                client_kwargs = {"timeout": 10.0}
-                if adapter:
-                    client_kwargs["adapter"] = adapter
-                self._client = BleakClient(self._address, **client_kwargs)
-
-                await asyncio.wait_for(
-                    self._client.connect(), timeout=12.0
-                )
-
-                # Verify GATT services resolved
-                if not self._client.services:
-                    logger.warning("[%s] GATT services empty on %s",
-                                   self._address, adapter_name)
-                    await self._safe_disconnect()
-                    continue
-
-                logger.info("[%s] Connected on %s (direct)", self._address,
-                            adapter_name)
-
-                # Allow GATT service resolution to settle
-                await asyncio.sleep(1.0)
-                await asyncio.wait_for(
-                    self._setup_notifications(), timeout=5.0
-                )
-
-                _consecutive_connect_failures = 0
-                return True
-
-            except Exception as e:
-                error_str = repr(e)
-                await self._safe_disconnect()
-
-                if "InProgress" in error_str:
-                    inprogress_failures += 1
-                    logger.info("[%s] %s busy (InProgress, direct)",
-                                self._address, adapter_name)
-                    await asyncio.sleep(0.5)
-                    continue
-
-                logger.info("[%s] Direct connect on %s failed: %s",
-                            self._address, adapter_name, error_str)
-
-        # ── Phase 2: Phantom cleanup + scan-based connect ─────────────
-        logger.info("[%s] Direct connect failed, cleaning up BlueZ...",
-                    self._address)
-        await self._cleanup_stale_bluez(adapters)
-
-        for adapter in adapters:
-            adapter_name = adapter or "default"
-
-            # Targeted scan with hard timeout
-            logger.info("[%s] Scanning on %s...", self._address, adapter_name)
-            device = None
-            try:
-                kwargs = {"timeout": 10.0}
-                if adapter:
-                    kwargs["adapter"] = adapter
-                device = await asyncio.wait_for(
-                    BleakScanner.find_device_by_address(
-                        self._address, **kwargs
-                    ),
-                    timeout=12.0,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("[%s] Scan on %s timed out",
-                               self._address, adapter_name)
-            except Exception as e:
-                error_str = repr(e)
-                if "InProgress" in error_str:
-                    inprogress_failures += 1
-                    logger.info("[%s] %s busy (InProgress, scan)",
-                                self._address, adapter_name)
-                    await asyncio.sleep(0.5)
-                    continue
-                logger.warning("[%s] Scan on %s failed: %s",
-                               self._address, adapter_name, e)
-
-            target = device if device is not None else self._address
-
-            try:
-                logger.info("[%s] Connecting on %s...",
-                            self._address, adapter_name)
-                client_kwargs = {"timeout": 15.0}
-                if adapter:
-                    client_kwargs["adapter"] = adapter
-                self._client = BleakClient(target, **client_kwargs)
-
-                await asyncio.wait_for(
-                    self._client.connect(), timeout=15.0
-                )
-
-                if not self._client.services:
-                    logger.warning("[%s] GATT services empty on %s",
-                                   self._address, adapter_name)
-                    await self._safe_disconnect()
-                    continue
-
-                logger.info("[%s] Connected on %s (scan)", self._address,
-                            adapter_name)
-
-                # Allow GATT service resolution to settle
-                await asyncio.sleep(1.0)
-                await asyncio.wait_for(
-                    self._setup_notifications(), timeout=5.0
-                )
-
-                _consecutive_connect_failures = 0
-                return True
-
-            except Exception as e:
-                error_str = repr(e)
-                await self._safe_disconnect()
-
-                if "InProgress" in error_str:
-                    inprogress_failures += 1
-                    logger.info("[%s] %s busy (InProgress, connect)",
-                                self._address, adapter_name)
-                    await asyncio.sleep(0.5)
-                    continue
-
-                logger.warning("[%s] Connect on %s failed: %s",
-                               self._address, adapter_name, error_str)
-                await asyncio.sleep(0.3)
-
-        # ── All attempts exhausted ────────────────────────────────────
-
-        if inprogress_failures >= len(adapters):
-            logger.warning("[%s] InProgress dominated (%d), clearing BlueZ",
-                           self._address, inprogress_failures)
-            await self._cancel_pending_hci(adapters)
-            self._run_cmd(["bluetoothctl", "remove", self._address])
-            await asyncio.sleep(3.0)
-
-        _consecutive_connect_failures += 1
-        logger.warning("[%s] Connect failed (%d/%d before adapter reset)",
-                       self._address, _consecutive_connect_failures,
-                       _ADAPTER_RESET_THRESHOLD)
-
-        if (
-            _consecutive_connect_failures >= _ADAPTER_RESET_THRESHOLD
-            and (_time.time() - _last_adapter_reset_time) > _ADAPTER_RESET_COOLDOWN
-        ):
-            await self._reset_adapters(adapters)
-            _last_adapter_reset_time = _time.time()
-            _consecutive_connect_failures = 0
-
-        return False
-
-    async def _safe_disconnect(self):
-        """Disconnect with timeout, swallowing errors."""
+    async def __aexit__(self, *exc: object) -> None:
         if self._client is not None:
             try:
-                await asyncio.wait_for(self._client.disconnect(), timeout=3.0)
+                await asyncio.wait_for(
+                    self._client.disconnect(), timeout=5.0
+                )
+                logger.debug("[%s] Disconnected", self._address)
             except Exception:
-                pass
+                logger.debug(
+                    "[%s] Disconnect failed", self._address, exc_info=True
+                )
             self._client = None
 
-    async def disconnect(self):
-        """Cleanly disconnect from the device."""
-        if self._client is not None:
-            try:
-                if self._client.is_connected:
-                    await self._client.disconnect()
-                    logger.info("[%s] Disconnected", self._address)
-            except Exception:
-                logger.exception("[%s] Error during disconnect", self._address)
-            finally:
-                self._client = None
-
-    # ── Relay commands ────────────────────────────────────────────────────
-
-    async def get_relay_state(self) -> bool | None:
-        """Query the current relay state.
-
-        Returns True (ON), False (OFF), or None on communication failure.
-        """
-        if not self.is_connected:
-            return None
-
-        resp = await self._send_command(cmd_get_status(), "getDeviceStatus")
-        if resp is None:
-            return None
-
-        if len(resp) >= 7 and resp[0] == 0x20 and resp[3] == 0x20 and resp[4] == 0x02:
-            on = bool(resp[6])
-            logger.info("[%s] Relay state: %s", self._address, "ON" if on else "OFF")
-            return on
-
-        logger.warning("[%s] Unexpected getDeviceStatus response: %s",
-                       self._address, resp.hex())
-        return None
-
-    async def set_relay(self, on: bool) -> bool | None:
-        """Set the relay state and verify with a follow-up status read.
-
-        Returns the confirmed relay state (True/False) or None on failure.
-        """
-        if not self.is_connected:
-            return None
-
-        label = "ON" if on else "OFF"
-        frame = cmd_set_status(on)
-        resp = await self._send_command(frame, "setDeviceStatus(%s)" % label)
-
-        if resp is None:
-            logger.warning("[%s] No ACK for set_relay(%s)", self._address, label)
-            return None
-
-        # Verify: set ACK byte 6 is result code (0x00 = success), not state.
-        if len(resp) >= 7 and resp[0] == 0x20 and resp[4] == 0x01:
-            result_code = resp[6]
-            if result_code != 0x00:
-                logger.warning("[%s] set_relay(%s) result code: 0x%02x",
-                               self._address, label, result_code)
-                return None
-        else:
-            logger.warning("[%s] Unexpected set response: %s",
-                           self._address, resp.hex())
-
-        # Read back actual state to confirm
-        await asyncio.sleep(0.3)
-        confirmed = await self.get_relay_state()
-        if confirmed is not None:
-            logger.info("[%s] set_relay(%s) confirmed: %s",
-                        self._address, label, "ON" if confirmed else "OFF")
-        return confirmed
-
-    # ── Internal helpers ──────────────────────────────────────────────────
-
-    @staticmethod
-    def _run_cmd(cmd: list[str], timeout: int = 5) -> str:
-        """Run a subprocess command, returning stdout or empty string."""
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout
-            )
-            return result.stdout or ""
-        except Exception:
-            return ""
-
-    async def _cleanup_stale_bluez(self, adapters: list[str]):
-        """Detect and clean up phantom/stale BlueZ connections.
-
-        Phantom = BlueZ reports Connected=yes but no HCI handle exists.
-        Fix: bluetoothctl remove to forget the stale state.
-
-        Also cancels pending LE Create Connection on each adapter and
-        drops any stale HCI handles for this device.
-        """
-        # Check if BlueZ thinks the device is connected
-        info_out = self._run_cmd(["bluetoothctl", "info", self._address], timeout=3)
-        bluez_connected = "Connected: yes" in info_out
-
-        if bluez_connected:
-            # Check for real HCI handle
-            has_handle = False
-            for adapter in adapters:
-                if not adapter:
-                    continue
-                con_out = self._run_cmd(
-                    ["hcitool", "-i", adapter, "con"], timeout=3
-                )
-                if self._address.upper() in con_out.upper():
-                    has_handle = True
-                    break
-
-            if not has_handle:
-                # Phantom: Connected=yes but no HCI handle
-                logger.warning("[%s] Phantom detected (Connected=yes, no HCI handle) "
-                               "— removing from BlueZ", self._address)
-                self._run_cmd(["bluetoothctl", "remove", self._address])
-                await asyncio.sleep(3.0)
-            else:
-                # Real connection exists — disconnect it
-                logger.info("[%s] Stale connection found, disconnecting",
-                            self._address)
-                self._run_cmd(["bluetoothctl", "disconnect", self._address])
-                await asyncio.sleep(1.0)
-
-        # Cancel pending LE connections and drop stale handles
-        await self._cancel_pending_hci(adapters)
-
-    async def _cancel_pending_hci(self, adapters: list[str]):
-        """Send HCI LE_Create_Connection_Cancel and drop stale handles."""
-        for adapter in adapters:
-            if not adapter:
-                continue
-            # Cancel any pending LE Create Connection
-            self._run_cmd(
-                ["hcitool", "-i", adapter, "cmd", "0x08", "0x000E"], timeout=3
-            )
-            # Drop stale HCI handles for this address
-            con_out = self._run_cmd(
-                ["hcitool", "-i", adapter, "con"], timeout=3
-            )
-            for line in con_out.splitlines():
-                if self._address.upper() in line.upper():
-                    parts = line.split("handle ")
-                    if len(parts) > 1:
-                        handle = parts[1].split()[0]
-                        self._run_cmd(
-                            ["hcitool", "-i", adapter, "ledc", handle],
-                            timeout=3,
-                        )
-                        logger.info("[%s] Dropped stale handle %s on %s",
-                                    self._address, handle, adapter)
-                        await asyncio.sleep(0.5)
-
-    async def _reset_adapters(self, adapters: list[str]):
-        """Reset BLE adapters via hciconfig down/up as a last resort."""
-        for adapter in adapters:
-            if not adapter:
-                continue
-            logger.warning("[%s] Resetting adapter %s", self._address, adapter)
-            self._run_cmd(["hciconfig", adapter, "down"], timeout=5)
-            await asyncio.sleep(1.0)
-            self._run_cmd(["hciconfig", adapter, "up"], timeout=5)
-
-        # Check bluetoothd is still running
-        ps_out = self._run_cmd(["pidof", "bluetoothd"], timeout=3)
-        if not ps_out.strip():
-            logger.warning("[%s] bluetoothd not running, restarting", self._address)
-            self._run_cmd(["/etc/init.d/bluetooth", "start"], timeout=10)
-
-        await asyncio.sleep(3.0)
-        logger.info("[%s] Adapter reset complete", self._address)
+    # ── Notification handling ─────────────────────────────────────────
 
     async def _setup_notifications(self):
         """Subscribe to SPP notify characteristic and handle CCCD."""
         if self._client is None:
             return
-
-        # Log available services for diagnostics
-        svc_uuids = [str(s.uuid) for s in self._client.services]
-        logger.debug("[%s] Services: %s", self._address, svc_uuids)
 
         await self._client.start_notify(SPP_NOTIFY, self._on_notify)
 
@@ -705,9 +316,13 @@ class ShyionSession:
                     if "2b10" in str(ch.uuid):
                         for desc in ch.descriptors:
                             if "2902" in str(desc.uuid):
-                                cccd = await self._client.read_gatt_descriptor(desc.handle)
+                                cccd = await self._client.read_gatt_descriptor(
+                                    desc.handle
+                                )
                                 if cccd == b'\x00\x00':
-                                    logger.info("[%s] Enabling CCCD", self._address)
+                                    logger.info(
+                                        "[%s] Enabling CCCD", self._address
+                                    )
                                     await self._client.write_gatt_descriptor(
                                         desc.handle, b'\x01\x00'
                                     )
@@ -716,31 +331,145 @@ class ShyionSession:
         """Handle incoming BLE notification."""
         payload = parse_frame(bytes(data))
         if payload is None:
-            logger.debug("[%s] Unparseable notification: %s", self._address, data.hex())
+            logger.debug(
+                "[%s] Unparseable notification: %s",
+                self._address, data.hex(),
+            )
             return
 
         self._response = payload
-        self._response_event.set()
+        if self._response_event is not None:
+            self._response_event.set()
+
+    # ── Command implementation ────────────────────────────────────────
 
     async def _send_command(self, frame: bytes, label: str) -> bytes | None:
         """Send a command frame and wait for the notification response."""
         if self._client is None or not self._client.is_connected:
             return None
 
-        # Recreate the event on the current running loop to avoid
-        # cross-loop issues when sessions are reused across threads.
         self._response_event = asyncio.Event()
         self._response = None
 
         try:
-            await self._client.write_gatt_char(SPP_WRITE, frame, response=False)
+            await self._client.write_gatt_char(
+                SPP_WRITE, frame, response=False
+            )
         except Exception:
-            logger.exception("[%s] Write failed for %s", self._address, label)
+            logger.exception(
+                "[%s] Write failed for %s", self._address, label
+            )
             return None
 
         try:
-            await asyncio.wait_for(self._response_event.wait(), timeout=5.0)
+            await asyncio.wait_for(
+                self._response_event.wait(), timeout=5.0
+            )
             return self._response
         except asyncio.TimeoutError:
-            logger.warning("[%s] No response for %s (5s timeout)", self._address, label)
+            logger.warning(
+                "[%s] No response for %s (5s timeout)",
+                self._address, label,
+            )
             return None
+
+    async def get_relay_state(self) -> bool | None:
+        """Query the current relay state.
+
+        Returns True (ON), False (OFF), or None on failure.
+        """
+        resp = await self._send_command(cmd_get_status(), "getDeviceStatus")
+        if resp is None:
+            return None
+
+        if (len(resp) >= 7 and resp[0] == 0x20
+                and resp[3] == 0x20 and resp[4] == 0x02):
+            on = bool(resp[6])
+            logger.info(
+                "[%s] Relay state: %s", self._address, "ON" if on else "OFF"
+            )
+            return on
+
+        logger.warning(
+            "[%s] Unexpected getDeviceStatus response: %s",
+            self._address, resp.hex(),
+        )
+        return None
+
+    async def set_relay(self, on: bool) -> bool | None:
+        """Set the relay state and verify with a follow-up status read.
+
+        Returns the confirmed relay state (True/False) or None on failure.
+        """
+        label = "ON" if on else "OFF"
+        frame = cmd_set_status(on)
+        resp = await self._send_command(frame, "setDeviceStatus(%s)" % label)
+
+        if resp is None:
+            logger.warning(
+                "[%s] No ACK for set_relay(%s)", self._address, label
+            )
+            return None
+
+        if len(resp) >= 7 and resp[0] == 0x20 and resp[4] == 0x01:
+            result_code = resp[6]
+            if result_code != 0x00:
+                logger.warning(
+                    "[%s] set_relay(%s) result code: 0x%02x",
+                    self._address, label, result_code,
+                )
+                return None
+        else:
+            logger.warning(
+                "[%s] Unexpected set response: %s",
+                self._address, resp.hex(),
+            )
+
+        # Read back actual state to confirm
+        await asyncio.sleep(0.3)
+        confirmed = await self.get_relay_state()
+        if confirmed is not None:
+            logger.info(
+                "[%s] set_relay(%s) confirmed: %s",
+                self._address, label, "ON" if confirmed else "OFF",
+            )
+        return confirmed
+
+
+# ── Convenience wrappers for background threads ──────────────────────────────
+
+async def poll_relay_state(
+    address: str,
+    lock_config: LockConfig | None = None,
+    scan_lock_config: ScanLockConfig | None = None,
+) -> bool | None:
+    """Connect, query relay state, disconnect.
+
+    Returns True (ON), False (OFF), or None on failure.
+    Designed to be called via ``asyncio.run()`` from a background thread.
+    """
+    try:
+        async with ShyionSession(address, lock_config, scan_lock_config) as s:
+            return await s.get_relay_state()
+    except Exception:
+        logger.exception("[%s] Poll failed", address)
+        return None
+
+
+async def toggle_relay(
+    address: str,
+    on: bool,
+    lock_config: LockConfig | None = None,
+    scan_lock_config: ScanLockConfig | None = None,
+) -> bool | None:
+    """Connect, set relay, read back state, disconnect.
+
+    Returns the confirmed relay state (True/False) or None on failure.
+    Designed to be called via ``asyncio.run()`` from a background thread.
+    """
+    try:
+        async with ShyionSession(address, lock_config, scan_lock_config) as s:
+            return await s.set_relay(on)
+    except Exception:
+        logger.exception("[%s] Toggle failed", address)
+        return None

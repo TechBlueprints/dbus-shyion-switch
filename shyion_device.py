@@ -39,10 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("shyion-device")
 
-# Add bleak from dbus-serialbattery if available
-_serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
-if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
-    sys.path.insert(1, _serialbattery_ext)
+# BLE dependencies are on sys.path via dbus-shyion-switch.py entry point
 
 from shyion_ble import ShyionSession, scan_for_relays  # noqa: E402
 

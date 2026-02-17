@@ -27,9 +27,9 @@ switch that directly controls the physical relay:
   - State ON  = relay energised (circuit closed)
   - State OFF = relay de-energised (circuit open)
 
-BLE connections are transient: the driver connects only when needed
-(user toggle or periodic state poll) and disconnects immediately after
-completing the operation.
+BLE connections are transient: each poll or toggle opens a fresh
+connection, performs the operation, and disconnects.  State is polled
+once per hour; toggles connect on-demand.
 
 Devices from config.ini are loaded at startup.  The discovery scan finds
 new devices that are not yet in the config.
@@ -49,19 +49,32 @@ from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 # Add ext folders to sys.path
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
+_ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 
-# Use bleak from dbus-serialbattery's vendored copy if not installed system-wide
-_serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
-if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
-    sys.path.insert(2, _serialbattery_ext)
+# All BLE dependencies from local ext/ submodules (upstream repos)
+for _sub in [
+    os.path.join(_ext_dir, "bleak-connection-manager", "src"),  # bleak_connection_manager
+    os.path.join(_ext_dir, "bleak-retry-connector", "src"),     # bleak_retry_connector
+    os.path.join(_ext_dir, "bluetooth-adapters", "src"),        # bluetooth_adapters
+    os.path.join(_ext_dir, "aiooui", "src"),                    # aiooui
+    os.path.join(_ext_dir, "bleak"),                            # bleak (package at repo root)
+]:
+    if os.path.isdir(_sub) and _sub not in sys.path:
+        sys.path.insert(0, _sub)
 
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
-from shyion_ble import ShyionSession, scan_for_relays, DiscoveredRelay  # noqa: E402
+from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
+from shyion_ble import (  # noqa: E402
+    poll_relay_state,
+    toggle_relay,
+    scan_for_relays,
+    DiscoveredRelay,
+)
 
-VERSION = "0.3.0-experimental"
+VERSION = "0.5.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,7 +85,7 @@ logger = logging.getLogger("dbus-shyion-switch")
 
 # Defaults
 DEFAULT_SCAN_INTERVAL = 60
-DEFAULT_POLL_INTERVAL_HOURS = 24
+DEFAULT_POLL_INTERVAL_MINUTES = 60
 
 # Status codes for SwitchableOutput (per Venus OS switch API)
 STATUS_OFF = 0x00          # Relay off
@@ -142,7 +155,9 @@ class ShyionSwitchService:
     Discovers devices via BLE scanning and/or config.ini.  Each relay
     appears as a toggleable switch in the Venus OS GUI.
 
-    BLE connections are transient: connect on toggle, disconnect after idle.
+    BLE connections are transient: each toggle or poll opens a fresh
+    connection, sends the command, reads the state, and disconnects.
+    State is polled once per hour.
     """
 
     def __init__(self):
@@ -151,26 +166,22 @@ class ShyionSwitchService:
 
         self._scan_interval = int(defaults.get(
             "scan_interval", str(DEFAULT_SCAN_INTERVAL)))
-        self._poll_interval_hours = float(defaults.get(
-            "poll_interval_hours", str(DEFAULT_POLL_INTERVAL_HOURS)))
+        self._poll_interval_minutes = float(defaults.get(
+            "poll_interval_minutes", str(DEFAULT_POLL_INTERVAL_MINUTES)))
 
         # BLE name prefixes for scanning
         prefix_config = defaults.get("name_prefixes", "BBKS").strip()
         self._name_prefixes = [p.strip() for p in prefix_config.split(",") if p.strip()]
 
-        # BLE adapters
-        adapter_config = defaults.get("bluetooth_adapters", "").strip()
-        if adapter_config:
-            self._adapters = [a.strip() for a in adapter_config.split(",") if a.strip()]
-        else:
-            self._adapters = self._detect_adapters()
+        # BCM lock configs for cross-process BLE coordination
+        self._lock_config = LockConfig(enabled=True)
+        self._scan_lock_config = ScanLockConfig(enabled=True)
 
         # Pre-configured devices from config.ini
         self._device_configs = get_device_configs(self._config)
         logger.info("Configured devices: %d", len(self._device_configs))
         logger.info("Scan interval: %ds", self._scan_interval)
-        logger.info("State poll interval: %.1fh", self._poll_interval_hours)
-        logger.info("BLE adapters: %s", self._adapters or ["default"])
+        logger.info("State poll interval: %.0f min", self._poll_interval_minutes)
 
         # D-Bus
         self._bus = get_bus()
@@ -269,23 +280,6 @@ class ShyionSwitchService:
         # Start the periodic state poll timer
         self._start_state_poll()
 
-    # ── Adapter detection ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _detect_adapters() -> list[str]:
-        adapters = []
-        try:
-            hci_dir = "/sys/class/bluetooth"
-            if os.path.isdir(hci_dir):
-                for entry in sorted(os.listdir(hci_dir)):
-                    if entry.startswith("hci") and ":" not in entry:
-                        adapters.append(entry)
-        except Exception:
-            logger.exception("Failed to detect BLE adapters")
-        if not adapters:
-            adapters = [""]
-        return adapters
-
     # ── Config loading ──────────────────────────────────────────────────────
 
     def _load_configured_devices(self):
@@ -301,9 +295,7 @@ class ShyionSwitchService:
                 model=conf.get("model", ""),
             )
 
-            # Try to restore last known relay state from settings
             self._restore_relay_state(mac_id)
-
             self._create_device_switch(mac_id, conf["name"])
             logger.info("Loaded device from config: %s (%s)", conf["name"], mac)
 
@@ -319,7 +311,7 @@ class ShyionSwitchService:
                 logger.debug("Restored relay state for %s: %s",
                              mac_id, "ON" if rs else "OFF")
         except Exception:
-            pass  # Setting doesn't exist yet, that's fine
+            pass
 
     # ── Discovery callbacks ─────────────────────────────────────────────────
 
@@ -374,8 +366,8 @@ class ShyionSwitchService:
         try:
             found = asyncio.run(
                 scan_for_relays(
-                    adapters=self._adapters,
                     timeout=15.0,
+                    scan_lock_config=self._scan_lock_config,
                 )
             )
             GLib.idle_add(self._process_scan_results, found)
@@ -403,19 +395,12 @@ class ShyionSwitchService:
     # ── Per-device switch management ────────────────────────────────────────
 
     def _create_device_switch(self, mac_id: str, name: str):
-        """Create a D-Bus switchable output for a relay device.
-
-        If we have a persisted relay state, the switch starts with that
-        state and the corresponding status.  Otherwise it starts OFF.
-        The State path controls the relay; toggling it triggers a BLE
-        connect-set-verify cycle.
-        """
+        """Create a D-Bus switchable output for a relay device."""
         output_path = "/SwitchableOutput/relay_%s" % mac_id
 
         if "%s/State" % output_path in self._dbusservice:
             return
 
-        # Use persisted state if available, otherwise OFF
         initial_state = self._last_known_state.get(mac_id)
         if initial_state is not None:
             initial_dbus_state = 1 if initial_state else 0
@@ -465,7 +450,6 @@ class ShyionSwitchService:
         name = self._get_device_name(mac_id)
         logger.info("Toggle '%s' (%s) -> %s", name, mac_id, "ON" if on else "OFF")
 
-        # Spawn background thread to connect and set relay
         thread = threading.Thread(
             target=self._run_toggle_relay,
             args=(mac_id, on),
@@ -487,33 +471,21 @@ class ShyionSwitchService:
     # ── BLE relay toggle (runs in background thread) ─────────────────────
 
     def _run_toggle_relay(self, mac_id: str, on: bool):
-        """Connect to device, set relay, verify, then schedule idle disconnect."""
-        try:
-            result = asyncio.run(self._toggle_relay(mac_id, on))
-            GLib.idle_add(self._apply_relay_result, mac_id, result)
-        except Exception:
-            logger.exception("Toggle relay failed for %s", mac_id)
-            GLib.idle_add(self._apply_relay_result, mac_id, None)
-
-    async def _toggle_relay(self, mac_id: str, on: bool) -> bool | None:
-        """Async: connect, set relay, verify state, disconnect."""
+        """Transient session: connect, set relay, read state, disconnect."""
         if mac_id not in self._device_info:
-            logger.error("No device info for %s", mac_id)
-            return None
+            logger.warning("[%s] Unknown device for toggle", mac_id)
+            GLib.idle_add(self._apply_relay_result, mac_id, None)
+            return
 
-        mac_address = self._device_info[mac_id].mac
-        session = ShyionSession(address=mac_address)
-
-        try:
-            ok = await session.connect(adapters=self._adapters)
-            if not ok:
-                logger.warning("[%s] Could not connect to set relay", mac_id)
-                return None
-
-            confirmed = await session.set_relay(on)
-            return confirmed
-        finally:
-            await session.disconnect()
+        address = self._device_info[mac_id].mac
+        result = asyncio.run(
+            toggle_relay(
+                address, on,
+                lock_config=self._lock_config,
+                scan_lock_config=self._scan_lock_config,
+            )
+        )
+        GLib.idle_add(self._apply_relay_result, mac_id, result)
 
     def _apply_relay_result(self, mac_id: str, state: bool | None) -> bool:
         """Apply BLE result to D-Bus (called on GLib thread)."""
@@ -527,7 +499,6 @@ class ShyionSwitchService:
             if status_path in self._dbusservice:
                 self._dbusservice[status_path] = STATUS_ON if state else STATUS_OFF
 
-            # Persist
             mac_address = self._device_info[mac_id].mac if mac_id in self._device_info else ""
             name = self._get_device_name(mac_id)
             self._save_device_to_settings(mac_id, name, mac_address)
@@ -545,20 +516,20 @@ class ShyionSwitchService:
 
     def _start_state_poll(self):
         """Start the periodic state poll timer and schedule an initial poll."""
-        interval_seconds = int(self._poll_interval_hours * 3600)
+        interval_seconds = int(self._poll_interval_minutes * 60)
 
-        # Always do an initial poll 30s after startup to confirm actual state
+        # Initial poll 30s after startup to confirm actual state
         if self._device_info:
             logger.info("Initial state poll in 30s for %d device(s)",
                         len(self._device_info))
             GLib.timeout_add_seconds(30, self._trigger_initial_poll)
 
         if interval_seconds <= 0:
-            logger.info("Periodic state polling disabled (poll_interval_hours=0)")
+            logger.info("Periodic state polling disabled (poll_interval_minutes=0)")
             return
 
-        logger.info("Periodic state poll: every %d hours",
-                     int(self._poll_interval_hours))
+        logger.info("Periodic state poll: every %.0f minutes",
+                     self._poll_interval_minutes)
 
         self._poll_timer_id = GLib.timeout_add_seconds(
             interval_seconds, self._trigger_state_poll
@@ -567,14 +538,10 @@ class ShyionSwitchService:
     def _trigger_initial_poll(self) -> bool:
         """One-shot wrapper for the initial state poll at startup."""
         self._trigger_state_poll()
-        return False  # Do not repeat
+        return False
 
     def _trigger_state_poll(self) -> bool:
-        """Fires periodically to poll all known devices.
-
-        Polls sequentially in a single background thread to avoid
-        overwhelming the BLE adapters.
-        """
+        """Fires periodically to poll all known devices."""
         logger.info("State poll: checking %d device(s)", len(self._device_info))
 
         thread = threading.Thread(
@@ -587,37 +554,24 @@ class ShyionSwitchService:
         return True
 
     def _run_poll_all_devices(self):
-        """Background thread: poll each device sequentially."""
+        """Background thread: poll each device sequentially (one at a time)."""
         for mac_id in list(self._device_info.keys()):
             self._run_poll_device(mac_id)
 
     def _run_poll_device(self, mac_id: str):
-        """Background thread: connect, read state, update D-Bus, disconnect."""
-        try:
-            state = asyncio.run(self._poll_device(mac_id))
-            GLib.idle_add(self._apply_poll_result, mac_id, state)
-        except Exception:
-            logger.exception("State poll failed for %s", mac_id)
-
-    async def _poll_device(self, mac_id: str) -> bool | None:
-        """Async: connect, get relay state, disconnect."""
+        """Transient session: connect, query state, disconnect."""
         if mac_id not in self._device_info:
-            return None
+            return
 
-        mac_address = self._device_info[mac_id].mac
-        adapter = self._adapters[0] if self._adapters and self._adapters[0] else ""
-        session = ShyionSession(address=mac_address, adapter=adapter)
-
-        try:
-            ok = await session.connect(adapters=self._adapters)
-            if not ok:
-                logger.warning("[%s] Poll: could not connect", mac_id)
-                return None
-
-            state = await session.get_relay_state()
-            return state
-        finally:
-            await session.disconnect()
+        address = self._device_info[mac_id].mac
+        state = asyncio.run(
+            poll_relay_state(
+                address,
+                lock_config=self._lock_config,
+                scan_lock_config=self._scan_lock_config,
+            )
+        )
+        GLib.idle_add(self._apply_poll_result, mac_id, state)
 
     def _apply_poll_result(self, mac_id: str, state: bool | None) -> bool:
         """Apply poll result to D-Bus (called on GLib thread)."""
@@ -635,7 +589,6 @@ class ShyionSwitchService:
         if status_path in self._dbusservice:
             self._dbusservice[status_path] = STATUS_ON if state else STATUS_OFF
 
-        # Persist state
         mac_address = self._device_info[mac_id].mac if mac_id in self._device_info else ""
         name = self._get_device_name(mac_id)
         self._save_device_to_settings(mac_id, name, mac_address)
@@ -667,7 +620,6 @@ class ShyionSwitchService:
             if mac_address:
                 settings_iface.AddSetting(
                     group, "%s/MAC" % prefix, mac_address, "s", 0, 0)
-            # RelayState: -1 = unknown, 0 = OFF, 1 = ON
             settings_iface.AddSetting(
                 group, "%s/RelayState" % prefix, -1, "i", -1, 1)
 
@@ -680,7 +632,6 @@ class ShyionSwitchService:
                     "com.victronenergy.settings", base + "/MAC"
                 ).SetValue(mac_address)
 
-            # Persist relay state
             relay_state = self._last_known_state.get(mac_id)
             if relay_state is not None:
                 self._bus.get_object(
@@ -713,7 +664,6 @@ class ShyionSwitchService:
 
                 mac_id = node_name.replace("Device_", "")
 
-                # Skip if already loaded from config
                 if mac_id in self._device_info:
                     continue
 
@@ -744,7 +694,6 @@ class ShyionSwitchService:
                             "%s/MAC" % device_path,
                         ).GetValue())
 
-                    # Restore last known relay state
                     if "RelayState" in sub_names:
                         rs = int(self._bus.get_object(
                             "com.victronenergy.settings",
