@@ -35,8 +35,20 @@ These devices use the Telink TLSR8266 BLE chipset and advertise as `BBKS-XXXX`.
 
 - **Venus OS** >= 3.x on a Cerbo GX (or compatible GX device with Bluetooth)
 - **Python 3** (included with Venus OS)
-- **bleak** -- BLE library (available from
-  `/data/apps/dbus-serialbattery/ext` if dbus-serialbattery is installed)
+- **Git** (for cloning; the installer will install it via `opkg` if needed)
+- One or two BLE adapters available on the GX device
+
+All BLE dependencies are vendored as git submodules in `ext/` -- no pip
+installs or external package management required:
+
+| Submodule | Purpose |
+|-----------|---------|
+| `velib_python` | Victron D-Bus service helper library |
+| `bleak` | Cross-platform BLE client library |
+| `bleak-retry-connector` | Connection retry logic with exponential backoff |
+| `bleak-connection-manager` | BLE connection lifecycle manager (scan locking, adapter rotation, health checks) |
+| `bluetooth-adapters` | HCI adapter enumeration |
+| `aiooui` | OUI (MAC vendor) lookups |
 
 ## Quick Install
 
@@ -49,9 +61,25 @@ curl -fsSL https://raw.githubusercontent.com/TechBlueprints/dbus-shyion-switch/m
 The installer will:
 1. Install git if needed
 2. Clone the repository to `/data/apps/dbus-shyion-switch`
-3. Initialize the `velib_python` library
+3. Initialize all git submodules (BLE stack + velib_python)
 4. Create the service symlink and rc.local entry
 5. Start the service
+
+### Manual Install
+
+```bash
+ssh root@<cerbo-ip>
+cd /data/apps
+git clone --recurse-submodules https://github.com/TechBlueprints/dbus-shyion-switch.git
+cd dbus-shyion-switch
+bash enable.sh
+```
+
+If you cloned without `--recurse-submodules`, initialize them manually:
+
+```bash
+git submodule update --init --recursive
+```
 
 ## Configuration
 
@@ -174,8 +202,14 @@ dbus-shyion-switch.py       Single-process service
   |
   +-- shyion_ble.py          BLE protocol module
   |     Telink SPP framing (XOR checksum, byte-stuffing)
-  |     Connect-on-demand with cross-process locking & adapter rotation
   |     getDeviceStatus / setDeviceStatus commands
+  |
+  +-- ext/bleak-connection-manager/   BLE connection lifecycle manager
+  |     Cross-process scan locking (fcntl.flock)
+  |     Cache-first scanning (BlueZ D-Bus cache before StartDiscovery)
+  |     Pre-scan adapter health checks (detects stale BlueZ state)
+  |     Adapter rotation and score-based selection
+  |     ConnectionWatchdog for dead connection detection
   |
   +-- shyion_device.py       Standalone CLI probe tool
   |
