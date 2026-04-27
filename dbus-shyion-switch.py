@@ -181,6 +181,11 @@ class ShyionSwitchService:
         self._device_info: dict[str, DiscoveredRelay] = {}
         self._last_known_state: dict[str, bool | None] = {}
 
+        # Per-device BLE session lock: ensures only one BLE session runs at a
+        # time for each device, preventing "NotPermitted: Notify acquired" when
+        # the GUI fires multiple rapid toggles before the first session closes.
+        self._device_ble_lock: dict[str, threading.Lock] = {}
+
         # Scanning state
         self._scan_timer_id = None
         self._scanning = False
@@ -392,6 +397,10 @@ class ShyionSwitchService:
         if "%s/State" % output_path in self._dbusservice:
             return
 
+        # Create the per-device BLE session lock if not already present
+        if mac_id not in self._device_ble_lock:
+            self._device_ble_lock[mac_id] = threading.Lock()
+
         initial_state = self._last_known_state.get(mac_id)
         if initial_state is not None:
             initial_dbus_state = 1 if initial_state else 0
@@ -441,15 +450,28 @@ class ShyionSwitchService:
         name = self._get_device_name(mac_id)
         logger.info("Toggle '%s' (%s) -> %s", name, mac_id, "ON" if on else "OFF")
 
+        lock = self._device_ble_lock.get(mac_id)
+        if lock is not None and not lock.acquire(blocking=False):
+            logger.warning(
+                "Toggle '%s' skipped: BLE session already in progress for this device",
+                name,
+            )
+            # Reject the write so the slider snaps back to the current known state
+            return False
+
+        # Reject the GUI write immediately -- we will apply the confirmed state
+        # after the BLE operation completes.  This keeps the slider at the old
+        # value and leaves SettingSync in "busy" state (buttons disabled) while
+        # the BLE operation is in flight (~20s).
         thread = threading.Thread(
             target=self._run_toggle_relay,
-            args=(mac_id, on),
+            args=(mac_id, on, lock),
             name="Shyion_Toggle_%s" % mac_id,
             daemon=True,
         )
         thread.start()
 
-        return True
+        return False
 
     def _get_device_name(self, mac_id: str) -> str:
         name_path = "/SwitchableOutput/relay_%s/Name" % mac_id
@@ -461,22 +483,45 @@ class ShyionSwitchService:
 
     # ── BLE relay toggle (runs in background thread) ─────────────────────
 
-    def _run_toggle_relay(self, mac_id: str, on: bool):
-        """Transient session: connect, set relay, read state, disconnect."""
+    def _run_toggle_relay(self, mac_id: str, on: bool, lock: threading.Lock | None = None):
+        """Transient session: connect, set relay, read state, disconnect.
+
+        ``lock`` should be the already-acquired per-device BLE lock.  It is
+        released when the operation completes.
+        """
         if mac_id not in self._device_info:
             logger.warning("[%s] Unknown device for toggle", mac_id)
+            if lock is not None:
+                lock.release()
             GLib.idle_add(self._apply_relay_result, mac_id, None)
             return
 
-        address = self._device_info[mac_id].mac
-        result = asyncio.run(
-            toggle_relay(
-                address, on,
-                lock_config=self._lock_config,
-                scan_lock_config=self._scan_lock_config,
+        # If no lock was passed (legacy call path), try to acquire one
+        if lock is None:
+            lock = self._device_ble_lock.get(mac_id)
+            if lock is not None and not lock.acquire(blocking=False):
+                logger.warning(
+                    "Toggle '%s' skipped: BLE session already in progress for this device",
+                    self._get_device_name(mac_id),
+                )
+                return
+            elif lock is None:
+                logger.warning("[%s] No BLE lock for device, skipping toggle", mac_id)
+                GLib.idle_add(self._apply_relay_result, mac_id, None)
+                return
+
+        try:
+            address = self._device_info[mac_id].mac
+            result = asyncio.run(
+                toggle_relay(
+                    address, on,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
+                )
             )
-        )
-        GLib.idle_add(self._apply_relay_result, mac_id, result)
+            GLib.idle_add(self._apply_relay_result, mac_id, result)
+        finally:
+            lock.release()
 
     def _apply_relay_result(self, mac_id: str, state: bool | None) -> bool:
         """Apply BLE result to D-Bus (called on GLib thread)."""
@@ -554,15 +599,27 @@ class ShyionSwitchService:
         if mac_id not in self._device_info:
             return
 
-        address = self._device_info[mac_id].mac
-        state = asyncio.run(
-            poll_relay_state(
-                address,
-                lock_config=self._lock_config,
-                scan_lock_config=self._scan_lock_config,
+        lock = self._device_ble_lock.get(mac_id)
+        if lock is not None and not lock.acquire(blocking=False):
+            logger.debug(
+                "Poll skipped for %s: BLE session already in progress",
+                self._get_device_name(mac_id),
             )
-        )
-        GLib.idle_add(self._apply_poll_result, mac_id, state)
+            return
+
+        try:
+            address = self._device_info[mac_id].mac
+            state = asyncio.run(
+                poll_relay_state(
+                    address,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
+                )
+            )
+            GLib.idle_add(self._apply_poll_result, mac_id, state)
+        finally:
+            if lock is not None:
+                lock.release()
 
     def _apply_poll_result(self, mac_id: str, state: bool | None) -> bool:
         """Apply poll result to D-Bus (called on GLib thread)."""

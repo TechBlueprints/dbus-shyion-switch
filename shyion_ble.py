@@ -291,6 +291,17 @@ class ShyionSession:
     async def __aexit__(self, *exc: object) -> None:
         if self._client is not None:
             try:
+                if self._client.is_connected:
+                    try:
+                        await asyncio.wait_for(
+                            self._client.stop_notify(SPP_NOTIFY), timeout=3.0
+                        )
+                        logger.debug("[%s] Notifications stopped", self._address)
+                    except Exception:
+                        logger.debug(
+                            "[%s] stop_notify failed (harmless)",
+                            self._address, exc_info=True,
+                        )
                 await asyncio.wait_for(
                     self._client.disconnect(), timeout=5.0
                 )
