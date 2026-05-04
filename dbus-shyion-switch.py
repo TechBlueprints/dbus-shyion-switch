@@ -186,6 +186,13 @@ class ShyionSwitchService:
         # the GUI fires multiple rapid toggles before the first session closes.
         self._device_ble_lock: dict[str, threading.Lock] = {}
 
+        # Per-device VeDbusItemImport handles for persistent settings.
+        # Keyed by "{mac_id}/Name", "{mac_id}/MAC", "{mac_id}/RelayState".
+        # Populated lazily by _register_device_settings().  Using stored
+        # VeDbusItemImport objects avoids repeated get_object() calls which
+        # accumulate and eventually exhaust the D-Bus connection limit.
+        self._device_settings: dict[str, object] = {}
+
         # Scanning state
         self._scan_timer_id = None
         self._scanning = False
@@ -295,17 +302,41 @@ class ShyionSwitchService:
             self._create_device_switch(mac_id, conf["name"])
             logger.info("Loaded device from config: %s (%s)", conf["name"], mac)
 
+    def _register_device_settings(self, mac_id: str, name: str, mac_address: str):
+        """Register per-device settings with localsettings via addSetting().
+
+        Returns VeDbusItemImport handles stored in self._device_settings so that
+        subsequent reads and writes go through the already-opened items rather
+        than creating new get_object() proxies each time.
+        """
+        group_path = "/Settings/Devices/shyion/Device_%s" % mac_id
+
+        for key, path, default, _min, _max in [
+            ("Name",       "%s/Name"       % group_path, name,        0, 0),
+            ("MAC",        "%s/MAC"        % group_path, mac_address,  0, 0),
+            ("RelayState", "%s/RelayState" % group_path, -1,          -1, 1),
+        ]:
+            item_key = "%s/%s" % (mac_id, key)
+            if item_key not in self._device_settings:
+                try:
+                    item = self._settings.addSetting(path, default, _min, _max)
+                    self._device_settings[item_key] = item
+                except Exception:
+                    logger.exception(
+                        "Failed to register setting %s for device %s", key, mac_id
+                    )
+
     def _restore_relay_state(self, mac_id: str):
         """Try to read persisted relay state from com.victronenergy.settings."""
+        self._register_device_settings(mac_id, mac_id, "")
         try:
-            path = "/Settings/Devices/shyion/Device_%s/RelayState" % mac_id
-            rs = int(self._bus.get_object(
-                "com.victronenergy.settings", path
-            ).GetValue())
-            if rs >= 0:
-                self._last_known_state[mac_id] = bool(rs)
-                logger.debug("Restored relay state for %s: %s",
-                             mac_id, "ON" if rs else "OFF")
+            item = self._device_settings.get("%s/RelayState" % mac_id)
+            if item is not None:
+                rs = item.get_value()
+                if rs is not None and int(rs) >= 0:
+                    self._last_known_state[mac_id] = bool(int(rs))
+                    logger.debug("Restored relay state for %s: %s",
+                                 mac_id, "ON" if rs else "OFF")
         except Exception:
             pass
 
@@ -653,38 +684,27 @@ class ShyionSwitchService:
     # ── Settings persistence ────────────────────────────────────────────────
 
     def _save_device_to_settings(self, mac_id: str, name: str, mac_address: str):
+        """Persist device name, MAC, and relay state via pre-opened VeDbusItemImport handles.
+
+        Uses self._device_settings populated by _register_device_settings() so
+        that no new D-Bus proxies (get_object calls) are created on each save.
+        """
         try:
-            settings_proxy = self._bus.get_object(
-                "com.victronenergy.settings", "/Settings"
-            )
-            settings_iface = dbus.Interface(
-                settings_proxy, "com.victronenergy.Settings"
-            )
+            # Ensure settings items exist (idempotent after first call)
+            self._register_device_settings(mac_id, name, mac_address)
 
-            group = "Devices/shyion"
-            prefix = "Device_%s" % mac_id
+            name_item = self._device_settings.get("%s/Name" % mac_id)
+            mac_item  = self._device_settings.get("%s/MAC" % mac_id)
+            rs_item   = self._device_settings.get("%s/RelayState" % mac_id)
 
-            settings_iface.AddSetting(group, "%s/Name" % prefix, name, "s", 0, 0)
-            if mac_address:
-                settings_iface.AddSetting(
-                    group, "%s/MAC" % prefix, mac_address, "s", 0, 0)
-            settings_iface.AddSetting(
-                group, "%s/RelayState" % prefix, -1, "i", -1, 1)
-
-            base = "/Settings/%s/%s" % (group, prefix)
-            self._bus.get_object(
-                "com.victronenergy.settings", base + "/Name"
-            ).SetValue(name)
-            if mac_address:
-                self._bus.get_object(
-                    "com.victronenergy.settings", base + "/MAC"
-                ).SetValue(mac_address)
+            if name_item is not None:
+                name_item.set_value(name)
+            if mac_item is not None and mac_address:
+                mac_item.set_value(mac_address)
 
             relay_state = self._last_known_state.get(mac_id)
-            if relay_state is not None:
-                self._bus.get_object(
-                    "com.victronenergy.settings", base + "/RelayState"
-                ).SetValue(1 if relay_state else 0)
+            if rs_item is not None and relay_state is not None:
+                rs_item.set_value(1 if relay_state else 0)
 
             logger.debug("Saved device %s to settings", mac_id)
 
@@ -729,26 +749,34 @@ class ShyionSwitchService:
                     sub_names = {n.get("name") for n in dev_root.findall("node")}
 
                     name = mac_id
+                    # Register settings items for this device (idempotent).
+                    # Reads go through the stored VeDbusItemImport handles to
+                    # avoid creating new get_object() proxies.
+                    self._register_device_settings(mac_id, mac_id, "")
+
                     if "Name" in sub_names:
-                        name = str(self._bus.get_object(
-                            "com.victronenergy.settings",
-                            "%s/Name" % device_path,
-                        ).GetValue())
+                        item = self._device_settings.get("%s/Name" % mac_id)
+                        if item is not None:
+                            v = item.get_value()
+                            if v is not None:
+                                name = str(v)
 
                     mac_address = ""
                     if "MAC" in sub_names:
-                        mac_address = str(self._bus.get_object(
-                            "com.victronenergy.settings",
-                            "%s/MAC" % device_path,
-                        ).GetValue())
+                        item = self._device_settings.get("%s/MAC" % mac_id)
+                        if item is not None:
+                            v = item.get_value()
+                            if v is not None:
+                                mac_address = str(v)
 
                     if "RelayState" in sub_names:
-                        rs = int(self._bus.get_object(
-                            "com.victronenergy.settings",
-                            "%s/RelayState" % device_path,
-                        ).GetValue())
-                        if rs >= 0:
-                            self._last_known_state[mac_id] = bool(rs)
+                        item = self._device_settings.get("%s/RelayState" % mac_id)
+                        if item is not None:
+                            v = item.get_value()
+                            if v is not None:
+                                rs = int(v)
+                                if rs >= 0:
+                                    self._last_known_state[mac_id] = bool(rs)
 
                     if mac_address:
                         self._device_info[mac_id] = DiscoveredRelay(
