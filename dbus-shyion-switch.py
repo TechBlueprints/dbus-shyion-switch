@@ -67,6 +67,7 @@ from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
 from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
+from bleak_connection_manager.dbus_bus import close_bus  # noqa: E402
 from shyion_ble import (  # noqa: E402
     poll_relay_state,
     toggle_relay,
@@ -96,6 +97,44 @@ STATUS_DISABLED = 0x20     # Disconnected / unknown
 def get_bus():
     """Return the shared system bus connection (singleton provided by dbus-python)."""
     return dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
+
+
+async def _with_bus_cleanup(coro):
+    """Run *coro*, then deterministically tear down BCM's shared
+    ``MessageBus`` so the underlying socket FD is closed before
+    ``asyncio.run()`` discards the loop.
+
+    Why this matters: each call site below uses ``asyncio.run()``
+    which spins up a fresh event loop in a background thread.
+    Inside, BCM's :func:`bleak_connection_manager.dbus_bus.get_bus`
+    lazily creates a ``dbus_fast.aio.MessageBus`` cached in a module
+    global.  When ``asyncio.run()`` returns, the loop is closed, but
+    the MessageBus's transport task is now bound to a dead loop —
+    its socket FD lingers until Python GC eventually reaps the
+    object.  On the next call, BCM detects the loop mismatch and
+    tries to disconnect, but the call schedules a coroutine on the
+    closed loop and raises (silently swallowed).  The net effect is
+    that dbus-daemon sees one new connection per ``asyncio.run()``
+    and never sees the matching disconnect until the kernel notices
+    the FD drop — which can be tens of minutes later.
+
+    Empirically (5-13-2026 audit): on a Cerbo with 7 devices polled
+    hourly, this leaks ~7 dbus connections per hour.  Over 4 hours
+    we observed dbus-shyion-switch holding 37 active connections
+    for ONE service name and dbus-daemon's VSZ growing past 700 MB
+    (on a 1 GB system).
+
+    Calling :func:`close_bus` inside ``finally`` here forces the
+    socket close while the loop is still alive — dbus-daemon sees
+    the disconnect immediately and frees per-connection state.
+    """
+    try:
+        return await coro
+    finally:
+        try:
+            await close_bus()
+        except Exception:
+            logger.debug("close_bus() raised during cleanup", exc_info=True)
 
 
 def load_config() -> configparser.ConfigParser:
@@ -392,9 +431,11 @@ class ShyionSwitchService:
     def _run_scan_thread(self):
         try:
             found = asyncio.run(
-                scan_for_relays(
-                    timeout=15.0,
-                    scan_lock_config=self._scan_lock_config,
+                _with_bus_cleanup(
+                    scan_for_relays(
+                        timeout=15.0,
+                        scan_lock_config=self._scan_lock_config,
+                    )
                 )
             )
             GLib.idle_add(self._process_scan_results, found)
@@ -544,10 +585,12 @@ class ShyionSwitchService:
         try:
             address = self._device_info[mac_id].mac
             result = asyncio.run(
-                toggle_relay(
-                    address, on,
-                    lock_config=self._lock_config,
-                    scan_lock_config=self._scan_lock_config,
+                _with_bus_cleanup(
+                    toggle_relay(
+                        address, on,
+                        lock_config=self._lock_config,
+                        scan_lock_config=self._scan_lock_config,
+                    )
                 )
             )
             GLib.idle_add(self._apply_relay_result, mac_id, result)
@@ -641,10 +684,12 @@ class ShyionSwitchService:
         try:
             address = self._device_info[mac_id].mac
             state = asyncio.run(
-                poll_relay_state(
-                    address,
-                    lock_config=self._lock_config,
-                    scan_lock_config=self._scan_lock_config,
+                _with_bus_cleanup(
+                    poll_relay_state(
+                        address,
+                        lock_config=self._lock_config,
+                        scan_lock_config=self._scan_lock_config,
+                    )
                 )
             )
             GLib.idle_add(self._apply_poll_result, mac_id, state)
