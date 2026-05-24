@@ -67,7 +67,6 @@ from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
 from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
-from bleak_connection_manager.dbus_bus import close_bus  # noqa: E402
 from shyion_ble import (  # noqa: E402
     poll_relay_state,
     toggle_relay,
@@ -97,44 +96,6 @@ STATUS_DISABLED = 0x20     # Disconnected / unknown
 def get_bus():
     """Return the shared system bus connection (singleton provided by dbus-python)."""
     return dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
-
-
-async def _with_bus_cleanup(coro):
-    """Run *coro*, then deterministically tear down BCM's shared
-    ``MessageBus`` so the underlying socket FD is closed before
-    ``asyncio.run()`` discards the loop.
-
-    Why this matters: each call site below uses ``asyncio.run()``
-    which spins up a fresh event loop in a background thread.
-    Inside, BCM's :func:`bleak_connection_manager.dbus_bus.get_bus`
-    lazily creates a ``dbus_fast.aio.MessageBus`` cached in a module
-    global.  When ``asyncio.run()`` returns, the loop is closed, but
-    the MessageBus's transport task is now bound to a dead loop —
-    its socket FD lingers until Python GC eventually reaps the
-    object.  On the next call, BCM detects the loop mismatch and
-    tries to disconnect, but the call schedules a coroutine on the
-    closed loop and raises (silently swallowed).  The net effect is
-    that dbus-daemon sees one new connection per ``asyncio.run()``
-    and never sees the matching disconnect until the kernel notices
-    the FD drop — which can be tens of minutes later.
-
-    Empirically (5-13-2026 audit): on a Cerbo with 7 devices polled
-    hourly, this leaks ~7 dbus connections per hour.  Over 4 hours
-    we observed dbus-shyion-switch holding 37 active connections
-    for ONE service name and dbus-daemon's VSZ growing past 700 MB
-    (on a 1 GB system).
-
-    Calling :func:`close_bus` inside ``finally`` here forces the
-    socket close while the loop is still alive — dbus-daemon sees
-    the disconnect immediately and frees per-connection state.
-    """
-    try:
-        return await coro
-    finally:
-        try:
-            await close_bus()
-        except Exception:
-            logger.debug("close_bus() raised during cleanup", exc_info=True)
 
 
 def load_config() -> configparser.ConfigParser:
@@ -238,6 +199,32 @@ class ShyionSwitchService:
 
         # State poll timer
         self._poll_timer_id = None
+
+        # ── Persistent asyncio event loop ──────────────────────────────────
+        # All BLE work runs inside this single, long-lived loop.  Reason:
+        # bleak keeps its BlueZManager (which owns the dbus_fast MessageBus
+        # to BlueZ) in a WeakKeyDictionary keyed by event loop.  Using
+        # ``asyncio.run()`` per operation creates a fresh loop and thus a
+        # fresh manager + MessageBus every time, which dbus_fast doesn't
+        # reliably tear down on loop close — leaking one system-bus
+        # connection per scan/toggle/poll until UID 0 hits the dbus-daemon
+        # connection cap and BLE breaks system-wide.  Routing every BLE
+        # coroutine through one shared loop means one BlueZManager, one
+        # MessageBus, no leak.  BLE connections themselves remain transient
+        # (open per operation, closed at the end of ShyionSession).
+        self._async_loop_ready = threading.Event()
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_thread = threading.Thread(
+            target=self._run_async_loop,
+            name="Shyion_AsyncLoop",
+            daemon=True,
+        )
+        self._async_thread.start()
+        # Block briefly so callers can submit immediately; 5 s is plenty
+        # for a thread to enter run_forever() and avoids deadlocking
+        # startup if the loop somehow fails to come up.
+        if not self._async_loop_ready.wait(timeout=5.0):
+            logger.error("Async event loop failed to start within 5 s")
 
         # ── Register as Venus OS switch device ──────────────────────────
         self._dbusservice = VeDbusService(
@@ -430,12 +417,10 @@ class ShyionSwitchService:
 
     def _run_scan_thread(self):
         try:
-            found = asyncio.run(
-                _with_bus_cleanup(
-                    scan_for_relays(
-                        timeout=15.0,
-                        scan_lock_config=self._scan_lock_config,
-                    )
+            found = self._submit_ble(
+                scan_for_relays(
+                    timeout=15.0,
+                    scan_lock_config=self._scan_lock_config,
                 )
             )
             GLib.idle_add(self._process_scan_results, found)
@@ -584,13 +569,11 @@ class ShyionSwitchService:
 
         try:
             address = self._device_info[mac_id].mac
-            result = asyncio.run(
-                _with_bus_cleanup(
-                    toggle_relay(
-                        address, on,
-                        lock_config=self._lock_config,
-                        scan_lock_config=self._scan_lock_config,
-                    )
+            result = self._submit_ble(
+                toggle_relay(
+                    address, on,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
                 )
             )
             GLib.idle_add(self._apply_relay_result, mac_id, result)
@@ -683,13 +666,11 @@ class ShyionSwitchService:
 
         try:
             address = self._device_info[mac_id].mac
-            state = asyncio.run(
-                _with_bus_cleanup(
-                    poll_relay_state(
-                        address,
-                        lock_config=self._lock_config,
-                        scan_lock_config=self._scan_lock_config,
-                    )
+            state = self._submit_ble(
+                poll_relay_state(
+                    address,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
                 )
             )
             GLib.idle_add(self._apply_poll_result, mac_id, state)
@@ -842,15 +823,53 @@ class ShyionSwitchService:
         except Exception:
             logger.exception("Error restoring devices from settings")
 
+    # ── Persistent asyncio loop ─────────────────────────────────────────────
+
+    def _run_async_loop(self):
+        """Daemon-thread entry point: run the shared asyncio loop forever.
+
+        Bleak's per-loop BlueZManager singleton is initialised lazily on
+        the first coroutine submitted; subsequent submissions reuse it.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._async_loop = loop
+        try:
+            self._async_loop_ready.set()
+            loop.run_forever()
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                logger.exception("Error closing async event loop")
+
+    def _submit_ble(self, coro):
+        """Submit a coroutine to the persistent loop and block until done.
+
+        Returns the coroutine's result, or re-raises its exception.
+        Intended for use from background worker threads — never call
+        from the GLib main thread (would block it).
+        """
+        if self._async_loop is None or not self._async_loop.is_running():
+            raise RuntimeError("Async event loop not available")
+        fut = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+        return fut.result()
+
     # ── Shutdown ────────────────────────────────────────────────────────────
 
     def stop(self):
-        """Clean shutdown: stop scanning, cancel timers."""
+        """Clean shutdown: stop scanning, cancel timers, stop async loop."""
         self._stop_scanning()
 
         if self._poll_timer_id is not None:
             GLib.source_remove(self._poll_timer_id)
             self._poll_timer_id = None
+
+        # Stop the persistent asyncio loop.  The daemon thread will exit
+        # naturally once run_forever() returns.
+        loop = self._async_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
 
         logger.info("Service stopped")
 
