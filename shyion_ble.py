@@ -52,6 +52,7 @@ import logging
 from dataclasses import dataclass
 
 from bleak import BleakClient
+from bleak_retry_connector import BleakNotFoundError
 
 from bleak_connection_manager import (
     EscalationConfig,
@@ -260,7 +261,10 @@ class ShyionSession:
         )
 
         if device is None:
-            raise ConnectionError(
+            # Same condition BCM's establish_connection reports for a device
+            # that vanishes between scan and connect -- raise the same type so
+            # callers have one "not reachable" case to handle.
+            raise BleakNotFoundError(
                 f"[{self._address}] Device not found after scanning"
             )
 
@@ -291,6 +295,17 @@ class ShyionSession:
     async def __aexit__(self, *exc: object) -> None:
         if self._client is not None:
             try:
+                if self._client.is_connected:
+                    try:
+                        await asyncio.wait_for(
+                            self._client.stop_notify(SPP_NOTIFY), timeout=3.0
+                        )
+                        logger.debug("[%s] Notifications stopped", self._address)
+                    except Exception:
+                        logger.debug(
+                            "[%s] stop_notify failed (harmless)",
+                            self._address, exc_info=True,
+                        )
                 await asyncio.wait_for(
                     self._client.disconnect(), timeout=5.0
                 )
@@ -451,6 +466,11 @@ async def poll_relay_state(
     try:
         async with ShyionSession(address, lock_config, scan_lock_config) as s:
             return await s.get_relay_state()
+    except BleakNotFoundError as exc:
+        # Expected whenever the relay is asleep or out of range -- log a single
+        # line rather than a traceback; the caller retries with backoff.
+        logger.warning("[%s] Not reachable, will retry later: %s", address, exc)
+        return None
     except Exception:
         logger.exception("[%s] Poll failed", address)
         return None
@@ -470,6 +490,9 @@ async def toggle_relay(
     try:
         async with ShyionSession(address, lock_config, scan_lock_config) as s:
             return await s.set_relay(on)
+    except BleakNotFoundError as exc:
+        logger.warning("[%s] Not reachable, toggle not applied: %s", address, exc)
+        return None
     except Exception:
         logger.exception("[%s] Toggle failed", address)
         return None

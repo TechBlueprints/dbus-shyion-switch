@@ -42,6 +42,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 
 import dbus
@@ -74,7 +75,7 @@ from shyion_ble import (  # noqa: E402
     DiscoveredRelay,
 )
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,24 +88,24 @@ logger = logging.getLogger("dbus-shyion-switch")
 DEFAULT_SCAN_INTERVAL = 60
 DEFAULT_POLL_INTERVAL_MINUTES = 60
 
+# Reconnect backoff after a failed BLE operation: retry delays double
+# from BASE up to MAX until the device answers again.
+RECONNECT_BASE_DELAY = 30      # seconds
+RECONNECT_MAX_DELAY = 900     # 15 minutes
+
+# Pause between the first failed toggle attempt and its retry, giving
+# the adapters a moment to settle before scanning again.
+TOGGLE_RETRY_DELAY = 3.0
+
 # Status codes for SwitchableOutput (per Venus OS switch API)
 STATUS_OFF = 0x00          # Relay off
 STATUS_ON = 0x09           # Relay on
 STATUS_DISABLED = 0x20     # Disconnected / unknown
 
 
-class SystemBus(dbus.bus.BusConnection):
-    def __new__(cls):
-        return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SYSTEM)
-
-
-class SessionBus(dbus.bus.BusConnection):
-    def __new__(cls):
-        return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SESSION)
-
-
-def get_bus() -> dbus.bus.BusConnection:
-    return SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else SystemBus()
+def get_bus():
+    """Return the shared system bus connection (singleton provided by dbus-python)."""
+    return dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
 
 
 def load_config() -> configparser.ConfigParser:
@@ -190,12 +191,55 @@ class ShyionSwitchService:
         self._device_info: dict[str, DiscoveredRelay] = {}
         self._last_known_state: dict[str, bool | None] = {}
 
+        # Per-device BLE session lock: ensures only one BLE session runs at a
+        # time for each device, preventing "NotPermitted: Notify acquired" when
+        # the GUI fires multiple rapid toggles before the first session closes.
+        self._device_ble_lock: dict[str, threading.Lock] = {}
+
+        # Per-device reconnect backoff after failed BLE operations.
+        # Keyed by mac_id; each entry holds the attempt counter and the
+        # pending GLib timer id (None when no retry is scheduled).
+        self._reconnect_state: dict[str, dict] = {}
+
+        # Per-device VeDbusItemImport handles for persistent settings.
+        # Keyed by "{mac_id}/Name", "{mac_id}/MAC", "{mac_id}/RelayState".
+        # Populated lazily by _register_device_settings().  Using stored
+        # VeDbusItemImport objects avoids repeated get_object() calls which
+        # accumulate and eventually exhaust the D-Bus connection limit.
+        self._device_settings: dict[str, object] = {}
+
         # Scanning state
         self._scan_timer_id = None
         self._scanning = False
 
         # State poll timer
         self._poll_timer_id = None
+
+        # ── Persistent asyncio event loop ──────────────────────────────────
+        # All BLE work runs inside this single, long-lived loop.  Reason:
+        # bleak keeps its BlueZManager (which owns the dbus_fast MessageBus
+        # to BlueZ) in a WeakKeyDictionary keyed by event loop.  Using
+        # ``asyncio.run()`` per operation creates a fresh loop and thus a
+        # fresh manager + MessageBus every time, which dbus_fast doesn't
+        # reliably tear down on loop close — leaking one system-bus
+        # connection per scan/toggle/poll until UID 0 hits the dbus-daemon
+        # connection cap and BLE breaks system-wide.  Routing every BLE
+        # coroutine through one shared loop means one BlueZManager, one
+        # MessageBus, no leak.  BLE connections themselves remain transient
+        # (open per operation, closed at the end of ShyionSession).
+        self._async_loop_ready = threading.Event()
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_thread = threading.Thread(
+            target=self._run_async_loop,
+            name="Shyion_AsyncLoop",
+            daemon=True,
+        )
+        self._async_thread.start()
+        # Block briefly so callers can submit immediately; 5 s is plenty
+        # for a thread to enter run_forever() and avoids deadlocking
+        # startup if the loop somehow fails to come up.
+        if not self._async_loop_ready.wait(timeout=5.0):
+            logger.error("Async event loop failed to start within 5 s")
 
         # ── Register as Venus OS switch device ──────────────────────────
         self._dbusservice = VeDbusService(
@@ -299,17 +343,41 @@ class ShyionSwitchService:
             self._create_device_switch(mac_id, conf["name"])
             logger.info("Loaded device from config: %s (%s)", conf["name"], mac)
 
+    def _register_device_settings(self, mac_id: str, name: str, mac_address: str):
+        """Register per-device settings with localsettings via addSetting().
+
+        Returns VeDbusItemImport handles stored in self._device_settings so that
+        subsequent reads and writes go through the already-opened items rather
+        than creating new get_object() proxies each time.
+        """
+        group_path = "/Settings/Devices/shyion/Device_%s" % mac_id
+
+        for key, path, default, _min, _max in [
+            ("Name",       "%s/Name"       % group_path, name,        0, 0),
+            ("MAC",        "%s/MAC"        % group_path, mac_address,  0, 0),
+            ("RelayState", "%s/RelayState" % group_path, -1,          -1, 1),
+        ]:
+            item_key = "%s/%s" % (mac_id, key)
+            if item_key not in self._device_settings:
+                try:
+                    item = self._settings.addSetting(path, default, _min, _max)
+                    self._device_settings[item_key] = item
+                except Exception:
+                    logger.exception(
+                        "Failed to register setting %s for device %s", key, mac_id
+                    )
+
     def _restore_relay_state(self, mac_id: str):
         """Try to read persisted relay state from com.victronenergy.settings."""
+        self._register_device_settings(mac_id, mac_id, "")
         try:
-            path = "/Settings/Devices/shyion/Device_%s/RelayState" % mac_id
-            rs = int(self._bus.get_object(
-                "com.victronenergy.settings", path
-            ).GetValue())
-            if rs >= 0:
-                self._last_known_state[mac_id] = bool(rs)
-                logger.debug("Restored relay state for %s: %s",
-                             mac_id, "ON" if rs else "OFF")
+            item = self._device_settings.get("%s/RelayState" % mac_id)
+            if item is not None:
+                rs = item.get_value()
+                if rs is not None and int(rs) >= 0:
+                    self._last_known_state[mac_id] = bool(int(rs))
+                    logger.debug("Restored relay state for %s: %s",
+                                 mac_id, "ON" if rs else "OFF")
         except Exception:
             pass
 
@@ -364,7 +432,7 @@ class ShyionSwitchService:
 
     def _run_scan_thread(self):
         try:
-            found = asyncio.run(
+            found = self._submit_ble(
                 scan_for_relays(
                     timeout=15.0,
                     scan_lock_config=self._scan_lock_config,
@@ -400,6 +468,10 @@ class ShyionSwitchService:
 
         if "%s/State" % output_path in self._dbusservice:
             return
+
+        # Create the per-device BLE session lock if not already present
+        if mac_id not in self._device_ble_lock:
+            self._device_ble_lock[mac_id] = threading.Lock()
 
         initial_state = self._last_known_state.get(mac_id)
         if initial_state is not None:
@@ -450,15 +522,40 @@ class ShyionSwitchService:
         name = self._get_device_name(mac_id)
         logger.info("Toggle '%s' (%s) -> %s", name, mac_id, "ON" if on else "OFF")
 
+        lock = self._device_ble_lock.get(mac_id)
+        if lock is not None and not lock.acquire(blocking=False):
+            logger.warning(
+                "Toggle '%s' skipped: BLE session already in progress for this device",
+                name,
+            )
+            # Reject the write so the slider snaps back to the current known state
+            return False
+
+        # Cancel any pending reconnect retry; this toggle supersedes it and
+        # its outcome will either clear the failure or restart the backoff.
+        self._cancel_reconnect(mac_id)
+
+        # Gray out the control while the BLE operation is in flight so the
+        # GUI shows "working" instead of an optimistic slider move that
+        # would snap back.  The confirmed state replaces this when the
+        # operation completes.
+        status_path = "/SwitchableOutput/relay_%s/Status" % mac_id
+        if status_path in self._dbusservice:
+            self._dbusservice[status_path] = STATUS_DISABLED
+
+        # Reject the GUI write immediately -- we will apply the confirmed state
+        # after the BLE operation completes.  This keeps the slider at the old
+        # value and leaves SettingSync in "busy" state (buttons disabled) while
+        # the BLE operation is in flight (~20s).
         thread = threading.Thread(
             target=self._run_toggle_relay,
-            args=(mac_id, on),
+            args=(mac_id, on, lock),
             name="Shyion_Toggle_%s" % mac_id,
             daemon=True,
         )
         thread.start()
 
-        return True
+        return False
 
     def _get_device_name(self, mac_id: str) -> str:
         name_path = "/SwitchableOutput/relay_%s/Name" % mac_id
@@ -470,22 +567,59 @@ class ShyionSwitchService:
 
     # ── BLE relay toggle (runs in background thread) ─────────────────────
 
-    def _run_toggle_relay(self, mac_id: str, on: bool):
-        """Transient session: connect, set relay, read state, disconnect."""
+    def _run_toggle_relay(self, mac_id: str, on: bool, lock: threading.Lock | None = None):
+        """Transient session: connect, set relay, read state, disconnect.
+
+        ``lock`` should be the already-acquired per-device BLE lock.  It is
+        released when the operation completes.
+        """
         if mac_id not in self._device_info:
             logger.warning("[%s] Unknown device for toggle", mac_id)
+            if lock is not None:
+                lock.release()
             GLib.idle_add(self._apply_relay_result, mac_id, None)
             return
 
-        address = self._device_info[mac_id].mac
-        result = asyncio.run(
-            toggle_relay(
-                address, on,
-                lock_config=self._lock_config,
-                scan_lock_config=self._scan_lock_config,
+        # If no lock was passed (legacy call path), try to acquire one
+        if lock is None:
+            lock = self._device_ble_lock.get(mac_id)
+            if lock is not None and not lock.acquire(blocking=False):
+                logger.warning(
+                    "Toggle '%s' skipped: BLE session already in progress for this device",
+                    self._get_device_name(mac_id),
+                )
+                return
+            elif lock is None:
+                logger.warning("[%s] No BLE lock for device, skipping toggle", mac_id)
+                GLib.idle_add(self._apply_relay_result, mac_id, None)
+                return
+
+        try:
+            address = self._device_info[mac_id].mac
+            result = self._submit_ble(
+                toggle_relay(
+                    address, on,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
+                )
             )
-        )
-        GLib.idle_add(self._apply_relay_result, mac_id, result)
+            if result is None:
+                # Scan/connect failures are usually transient (adapter
+                # contention); one more attempt resolves most of them.
+                logger.warning(
+                    "[%s] Toggle failed, retrying once", mac_id
+                )
+                time.sleep(TOGGLE_RETRY_DELAY)
+                result = self._submit_ble(
+                    toggle_relay(
+                        address, on,
+                        lock_config=self._lock_config,
+                        scan_lock_config=self._scan_lock_config,
+                    )
+                )
+            GLib.idle_add(self._apply_relay_result, mac_id, result)
+        finally:
+            lock.release()
 
     def _apply_relay_result(self, mac_id: str, state: bool | None) -> bool:
         """Apply BLE result to D-Bus (called on GLib thread)."""
@@ -493,6 +627,7 @@ class ShyionSwitchService:
         status_path = "/SwitchableOutput/relay_%s/Status" % mac_id
 
         if state is not None:
+            self._cancel_reconnect(mac_id)
             self._last_known_state[mac_id] = state
             if state_path in self._dbusservice:
                 self._dbusservice[state_path] = 1 if state else 0
@@ -509,6 +644,9 @@ class ShyionSwitchService:
             if status_path in self._dbusservice:
                 self._dbusservice[status_path] = STATUS_DISABLED
             logger.warning("Relay %s: communication failed", self._get_device_name(mac_id))
+            # Keep retrying in the background; a successful poll restores
+            # the real state and clears the disabled status.
+            self._schedule_reconnect(mac_id)
 
         return False
 
@@ -563,15 +701,27 @@ class ShyionSwitchService:
         if mac_id not in self._device_info:
             return
 
-        address = self._device_info[mac_id].mac
-        state = asyncio.run(
-            poll_relay_state(
-                address,
-                lock_config=self._lock_config,
-                scan_lock_config=self._scan_lock_config,
+        lock = self._device_ble_lock.get(mac_id)
+        if lock is not None and not lock.acquire(blocking=False):
+            logger.debug(
+                "Poll skipped for %s: BLE session already in progress",
+                self._get_device_name(mac_id),
             )
-        )
-        GLib.idle_add(self._apply_poll_result, mac_id, state)
+            return
+
+        try:
+            address = self._device_info[mac_id].mac
+            state = self._submit_ble(
+                poll_relay_state(
+                    address,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
+                )
+            )
+            GLib.idle_add(self._apply_poll_result, mac_id, state)
+        finally:
+            if lock is not None:
+                lock.release()
 
     def _apply_poll_result(self, mac_id: str, state: bool | None) -> bool:
         """Apply poll result to D-Bus (called on GLib thread)."""
@@ -581,6 +731,7 @@ class ShyionSwitchService:
         state_path = "/SwitchableOutput/relay_%s/State" % mac_id
         status_path = "/SwitchableOutput/relay_%s/Status" % mac_id
 
+        self._cancel_reconnect(mac_id)
         old_state = self._last_known_state.get(mac_id)
         self._last_known_state[mac_id] = state
 
@@ -602,41 +753,111 @@ class ShyionSwitchService:
 
         return False
 
+    # ── Reconnect backoff after failed operations ───────────────────────────
+
+    def _schedule_reconnect(self, mac_id: str) -> bool:
+        """Schedule a reconnect poll with exponential backoff (GLib thread).
+
+        Called after a failed BLE operation.  Retry delays double from
+        RECONNECT_BASE_DELAY up to RECONNECT_MAX_DELAY until a poll or
+        toggle succeeds, at which point _cancel_reconnect() resets the
+        backoff and the disabled status is replaced by the real state.
+        """
+        state = self._reconnect_state.setdefault(
+            mac_id, {"attempt": 0, "timer_id": None}
+        )
+        if state["timer_id"] is not None:
+            return False  # Retry already scheduled
+
+        delay = min(
+            RECONNECT_BASE_DELAY * (2 ** state["attempt"]),
+            RECONNECT_MAX_DELAY,
+        )
+        state["attempt"] += 1
+        state["timer_id"] = GLib.timeout_add_seconds(
+            delay, self._trigger_reconnect, mac_id
+        )
+        logger.info("Reconnect attempt %d for %s in %ds",
+                    state["attempt"], self._get_device_name(mac_id), delay)
+        return False
+
+    def _trigger_reconnect(self, mac_id: str) -> bool:
+        """One-shot timer callback: run the reconnect poll in a thread."""
+        state = self._reconnect_state.get(mac_id)
+        if state is not None:
+            state["timer_id"] = None
+
+        thread = threading.Thread(
+            target=self._run_reconnect,
+            args=(mac_id,),
+            name="Shyion_Reconnect_%s" % mac_id,
+            daemon=True,
+        )
+        thread.start()
+        return False
+
+    def _run_reconnect(self, mac_id: str):
+        """Background thread: poll a device that previously failed."""
+        if mac_id not in self._device_info:
+            return
+
+        lock = self._device_ble_lock.get(mac_id)
+        if lock is None or not lock.acquire(blocking=False):
+            # Another BLE session is running for this device; its result
+            # will settle the status.  Try again later just in case.
+            GLib.idle_add(self._schedule_reconnect, mac_id)
+            return
+
+        state: bool | None = None
+        try:
+            address = self._device_info[mac_id].mac
+            state = self._submit_ble(
+                poll_relay_state(
+                    address,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
+                )
+            )
+        except Exception:
+            logger.exception("[%s] Reconnect poll failed", mac_id)
+        finally:
+            lock.release()
+
+        if state is None:
+            GLib.idle_add(self._schedule_reconnect, mac_id)
+        else:
+            GLib.idle_add(self._apply_poll_result, mac_id, state)
+
+    def _cancel_reconnect(self, mac_id: str):
+        """Stop pending reconnect retries and reset the backoff (GLib thread)."""
+        state = self._reconnect_state.pop(mac_id, None)
+        if state is not None and state["timer_id"] is not None:
+            GLib.source_remove(state["timer_id"])
+
     # ── Settings persistence ────────────────────────────────────────────────
 
     def _save_device_to_settings(self, mac_id: str, name: str, mac_address: str):
+        """Persist device name, MAC, and relay state via pre-opened VeDbusItemImport handles.
+
+        Uses self._device_settings populated by _register_device_settings() so
+        that no new D-Bus proxies (get_object calls) are created on each save.
+        """
         try:
-            settings_proxy = self._bus.get_object(
-                "com.victronenergy.settings", "/Settings"
-            )
-            settings_iface = dbus.Interface(
-                settings_proxy, "com.victronenergy.Settings"
-            )
+            # Ensure settings items exist (idempotent after first call)
+            self._register_device_settings(mac_id, name, mac_address)
 
-            group = "Devices/shyion"
-            prefix = "Device_%s" % mac_id
+            name_item = self._device_settings.get("%s/Name" % mac_id)
+            mac_item  = self._device_settings.get("%s/MAC" % mac_id)
+            rs_item   = self._device_settings.get("%s/RelayState" % mac_id)
 
-            settings_iface.AddSetting(group, "%s/Name" % prefix, name, "s", 0, 0)
-            if mac_address:
-                settings_iface.AddSetting(
-                    group, "%s/MAC" % prefix, mac_address, "s", 0, 0)
-            settings_iface.AddSetting(
-                group, "%s/RelayState" % prefix, -1, "i", -1, 1)
-
-            base = "/Settings/%s/%s" % (group, prefix)
-            self._bus.get_object(
-                "com.victronenergy.settings", base + "/Name"
-            ).SetValue(name)
-            if mac_address:
-                self._bus.get_object(
-                    "com.victronenergy.settings", base + "/MAC"
-                ).SetValue(mac_address)
+            if name_item is not None:
+                name_item.set_value(name)
+            if mac_item is not None and mac_address:
+                mac_item.set_value(mac_address)
 
             relay_state = self._last_known_state.get(mac_id)
-            if relay_state is not None:
-                self._bus.get_object(
-                    "com.victronenergy.settings", base + "/RelayState"
-                ).SetValue(1 if relay_state else 0)
+            if rs_item is not None and relay_state is not None:
+                rs_item.set_value(1 if relay_state else 0)
 
             logger.debug("Saved device %s to settings", mac_id)
 
@@ -681,26 +902,34 @@ class ShyionSwitchService:
                     sub_names = {n.get("name") for n in dev_root.findall("node")}
 
                     name = mac_id
+                    # Register settings items for this device (idempotent).
+                    # Reads go through the stored VeDbusItemImport handles to
+                    # avoid creating new get_object() proxies.
+                    self._register_device_settings(mac_id, mac_id, "")
+
                     if "Name" in sub_names:
-                        name = str(self._bus.get_object(
-                            "com.victronenergy.settings",
-                            "%s/Name" % device_path,
-                        ).GetValue())
+                        item = self._device_settings.get("%s/Name" % mac_id)
+                        if item is not None:
+                            v = item.get_value()
+                            if v is not None:
+                                name = str(v)
 
                     mac_address = ""
                     if "MAC" in sub_names:
-                        mac_address = str(self._bus.get_object(
-                            "com.victronenergy.settings",
-                            "%s/MAC" % device_path,
-                        ).GetValue())
+                        item = self._device_settings.get("%s/MAC" % mac_id)
+                        if item is not None:
+                            v = item.get_value()
+                            if v is not None:
+                                mac_address = str(v)
 
                     if "RelayState" in sub_names:
-                        rs = int(self._bus.get_object(
-                            "com.victronenergy.settings",
-                            "%s/RelayState" % device_path,
-                        ).GetValue())
-                        if rs >= 0:
-                            self._last_known_state[mac_id] = bool(rs)
+                        item = self._device_settings.get("%s/RelayState" % mac_id)
+                        if item is not None:
+                            v = item.get_value()
+                            if v is not None:
+                                rs = int(v)
+                                if rs >= 0:
+                                    self._last_known_state[mac_id] = bool(rs)
 
                     if mac_address:
                         self._device_info[mac_id] = DiscoveredRelay(
@@ -721,15 +950,56 @@ class ShyionSwitchService:
         except Exception:
             logger.exception("Error restoring devices from settings")
 
+    # ── Persistent asyncio loop ─────────────────────────────────────────────
+
+    def _run_async_loop(self):
+        """Daemon-thread entry point: run the shared asyncio loop forever.
+
+        Bleak's per-loop BlueZManager singleton is initialised lazily on
+        the first coroutine submitted; subsequent submissions reuse it.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._async_loop = loop
+        try:
+            self._async_loop_ready.set()
+            loop.run_forever()
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                logger.exception("Error closing async event loop")
+
+    def _submit_ble(self, coro):
+        """Submit a coroutine to the persistent loop and block until done.
+
+        Returns the coroutine's result, or re-raises its exception.
+        Intended for use from background worker threads — never call
+        from the GLib main thread (would block it).
+        """
+        if self._async_loop is None or not self._async_loop.is_running():
+            raise RuntimeError("Async event loop not available")
+        fut = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+        return fut.result()
+
     # ── Shutdown ────────────────────────────────────────────────────────────
 
     def stop(self):
-        """Clean shutdown: stop scanning, cancel timers."""
+        """Clean shutdown: stop scanning, cancel timers, stop async loop."""
         self._stop_scanning()
 
         if self._poll_timer_id is not None:
             GLib.source_remove(self._poll_timer_id)
             self._poll_timer_id = None
+
+        for mac_id in list(self._reconnect_state.keys()):
+            self._cancel_reconnect(mac_id)
+
+        # Stop the persistent asyncio loop.  The daemon thread will exit
+        # naturally once run_forever() returns.
+        loop = self._async_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
 
         logger.info("Service stopped")
 
