@@ -42,6 +42,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 
 import dbus
@@ -74,7 +75,7 @@ from shyion_ble import (  # noqa: E402
     DiscoveredRelay,
 )
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,6 +87,15 @@ logger = logging.getLogger("dbus-shyion-switch")
 # Defaults
 DEFAULT_SCAN_INTERVAL = 60
 DEFAULT_POLL_INTERVAL_MINUTES = 60
+
+# Reconnect backoff after a failed BLE operation: retry delays double
+# from BASE up to MAX until the device answers again.
+RECONNECT_BASE_DELAY = 30      # seconds
+RECONNECT_MAX_DELAY = 900     # 15 minutes
+
+# Pause between the first failed toggle attempt and its retry, giving
+# the adapters a moment to settle before scanning again.
+TOGGLE_RETRY_DELAY = 3.0
 
 # Status codes for SwitchableOutput (per Venus OS switch API)
 STATUS_OFF = 0x00          # Relay off
@@ -185,6 +195,11 @@ class ShyionSwitchService:
         # time for each device, preventing "NotPermitted: Notify acquired" when
         # the GUI fires multiple rapid toggles before the first session closes.
         self._device_ble_lock: dict[str, threading.Lock] = {}
+
+        # Per-device reconnect backoff after failed BLE operations.
+        # Keyed by mac_id; each entry holds the attempt counter and the
+        # pending GLib timer id (None when no retry is scheduled).
+        self._reconnect_state: dict[str, dict] = {}
 
         # Per-device VeDbusItemImport handles for persistent settings.
         # Keyed by "{mac_id}/Name", "{mac_id}/MAC", "{mac_id}/RelayState".
@@ -516,6 +531,18 @@ class ShyionSwitchService:
             # Reject the write so the slider snaps back to the current known state
             return False
 
+        # Cancel any pending reconnect retry; this toggle supersedes it and
+        # its outcome will either clear the failure or restart the backoff.
+        self._cancel_reconnect(mac_id)
+
+        # Gray out the control while the BLE operation is in flight so the
+        # GUI shows "working" instead of an optimistic slider move that
+        # would snap back.  The confirmed state replaces this when the
+        # operation completes.
+        status_path = "/SwitchableOutput/relay_%s/Status" % mac_id
+        if status_path in self._dbusservice:
+            self._dbusservice[status_path] = STATUS_DISABLED
+
         # Reject the GUI write immediately -- we will apply the confirmed state
         # after the BLE operation completes.  This keeps the slider at the old
         # value and leaves SettingSync in "busy" state (buttons disabled) while
@@ -576,6 +603,20 @@ class ShyionSwitchService:
                     scan_lock_config=self._scan_lock_config,
                 )
             )
+            if result is None:
+                # Scan/connect failures are usually transient (adapter
+                # contention); one more attempt resolves most of them.
+                logger.warning(
+                    "[%s] Toggle failed, retrying once", mac_id
+                )
+                time.sleep(TOGGLE_RETRY_DELAY)
+                result = self._submit_ble(
+                    toggle_relay(
+                        address, on,
+                        lock_config=self._lock_config,
+                        scan_lock_config=self._scan_lock_config,
+                    )
+                )
             GLib.idle_add(self._apply_relay_result, mac_id, result)
         finally:
             lock.release()
@@ -586,6 +627,7 @@ class ShyionSwitchService:
         status_path = "/SwitchableOutput/relay_%s/Status" % mac_id
 
         if state is not None:
+            self._cancel_reconnect(mac_id)
             self._last_known_state[mac_id] = state
             if state_path in self._dbusservice:
                 self._dbusservice[state_path] = 1 if state else 0
@@ -602,6 +644,9 @@ class ShyionSwitchService:
             if status_path in self._dbusservice:
                 self._dbusservice[status_path] = STATUS_DISABLED
             logger.warning("Relay %s: communication failed", self._get_device_name(mac_id))
+            # Keep retrying in the background; a successful poll restores
+            # the real state and clears the disabled status.
+            self._schedule_reconnect(mac_id)
 
         return False
 
@@ -686,6 +731,7 @@ class ShyionSwitchService:
         state_path = "/SwitchableOutput/relay_%s/State" % mac_id
         status_path = "/SwitchableOutput/relay_%s/Status" % mac_id
 
+        self._cancel_reconnect(mac_id)
         old_state = self._last_known_state.get(mac_id)
         self._last_known_state[mac_id] = state
 
@@ -706,6 +752,87 @@ class ShyionSwitchService:
                          self._get_device_name(mac_id), "ON" if state else "OFF")
 
         return False
+
+    # ── Reconnect backoff after failed operations ───────────────────────────
+
+    def _schedule_reconnect(self, mac_id: str) -> bool:
+        """Schedule a reconnect poll with exponential backoff (GLib thread).
+
+        Called after a failed BLE operation.  Retry delays double from
+        RECONNECT_BASE_DELAY up to RECONNECT_MAX_DELAY until a poll or
+        toggle succeeds, at which point _cancel_reconnect() resets the
+        backoff and the disabled status is replaced by the real state.
+        """
+        state = self._reconnect_state.setdefault(
+            mac_id, {"attempt": 0, "timer_id": None}
+        )
+        if state["timer_id"] is not None:
+            return False  # Retry already scheduled
+
+        delay = min(
+            RECONNECT_BASE_DELAY * (2 ** state["attempt"]),
+            RECONNECT_MAX_DELAY,
+        )
+        state["attempt"] += 1
+        state["timer_id"] = GLib.timeout_add_seconds(
+            delay, self._trigger_reconnect, mac_id
+        )
+        logger.info("Reconnect attempt %d for %s in %ds",
+                    state["attempt"], self._get_device_name(mac_id), delay)
+        return False
+
+    def _trigger_reconnect(self, mac_id: str) -> bool:
+        """One-shot timer callback: run the reconnect poll in a thread."""
+        state = self._reconnect_state.get(mac_id)
+        if state is not None:
+            state["timer_id"] = None
+
+        thread = threading.Thread(
+            target=self._run_reconnect,
+            args=(mac_id,),
+            name="Shyion_Reconnect_%s" % mac_id,
+            daemon=True,
+        )
+        thread.start()
+        return False
+
+    def _run_reconnect(self, mac_id: str):
+        """Background thread: poll a device that previously failed."""
+        if mac_id not in self._device_info:
+            return
+
+        lock = self._device_ble_lock.get(mac_id)
+        if lock is None or not lock.acquire(blocking=False):
+            # Another BLE session is running for this device; its result
+            # will settle the status.  Try again later just in case.
+            GLib.idle_add(self._schedule_reconnect, mac_id)
+            return
+
+        state: bool | None = None
+        try:
+            address = self._device_info[mac_id].mac
+            state = self._submit_ble(
+                poll_relay_state(
+                    address,
+                    lock_config=self._lock_config,
+                    scan_lock_config=self._scan_lock_config,
+                )
+            )
+        except Exception:
+            logger.exception("[%s] Reconnect poll failed", mac_id)
+        finally:
+            lock.release()
+
+        if state is None:
+            GLib.idle_add(self._schedule_reconnect, mac_id)
+        else:
+            GLib.idle_add(self._apply_poll_result, mac_id, state)
+
+    def _cancel_reconnect(self, mac_id: str):
+        """Stop pending reconnect retries and reset the backoff (GLib thread)."""
+        state = self._reconnect_state.pop(mac_id, None)
+        if state is not None and state["timer_id"] is not None:
+            GLib.source_remove(state["timer_id"])
 
     # ── Settings persistence ────────────────────────────────────────────────
 
@@ -864,6 +991,9 @@ class ShyionSwitchService:
         if self._poll_timer_id is not None:
             GLib.source_remove(self._poll_timer_id)
             self._poll_timer_id = None
+
+        for mac_id in list(self._reconnect_state.keys()):
+            self._cancel_reconnect(mac_id)
 
         # Stop the persistent asyncio loop.  The daemon thread will exit
         # naturally once run_forever() returns.
