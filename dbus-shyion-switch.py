@@ -67,15 +67,9 @@ for _sub in [
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
-from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
-from shyion_ble import (  # noqa: E402
-    poll_relay_state,
-    toggle_relay,
-    scan_for_relays,
-    DiscoveredRelay,
-)
+import shyion_bcm  # noqa: E402  (must not import bleak at module scope)
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,6 +142,25 @@ def get_device_configs(config: configparser.ConfigParser) -> dict[str, dict[str,
     return devices
 
 
+# ── BLE stack ───────────────────────────────────────────────────────────────
+
+# The catcher rebinds bleak's client and scanner process-wide, and only
+# reaches modules imported after it runs.  shyion_ble binds bleak at module
+# scope, so the install has to happen here, between reading the config and
+# importing it.
+_CONFIG = load_config()
+shyion_bcm.install_connection_manager(
+    _CONFIG["DEFAULT"] if "DEFAULT" in _CONFIG else {}
+)
+
+from shyion_ble import (  # noqa: E402
+    poll_relay_state,
+    toggle_relay,
+    scan_for_relays,
+    DiscoveredRelay,
+)
+
+
 # ── Discovery / Management Service ──────────────────────────────────────────
 
 class ShyionSwitchService:
@@ -162,7 +175,7 @@ class ShyionSwitchService:
     """
 
     def __init__(self):
-        self._config = load_config()
+        self._config = _CONFIG
         defaults = self._config["DEFAULT"] if "DEFAULT" in self._config else {}
 
         self._scan_interval = int(defaults.get(
@@ -173,10 +186,6 @@ class ShyionSwitchService:
         # BLE name prefixes for scanning
         prefix_config = defaults.get("name_prefixes", "BBKS").strip()
         self._name_prefixes = [p.strip() for p in prefix_config.split(",") if p.strip()]
-
-        # BCM lock configs for cross-process BLE coordination
-        self._lock_config = LockConfig(enabled=True)
-        self._scan_lock_config = ScanLockConfig(enabled=True)
 
         # Pre-configured devices from config.ini
         self._device_configs = get_device_configs(self._config)
@@ -433,10 +442,7 @@ class ShyionSwitchService:
     def _run_scan_thread(self):
         try:
             found = self._submit_ble(
-                scan_for_relays(
-                    timeout=15.0,
-                    scan_lock_config=self._scan_lock_config,
-                )
+                scan_for_relays(timeout=15.0)
             )
             GLib.idle_add(self._process_scan_results, found)
         except Exception:
@@ -597,11 +603,7 @@ class ShyionSwitchService:
         try:
             address = self._device_info[mac_id].mac
             result = self._submit_ble(
-                toggle_relay(
-                    address, on,
-                    lock_config=self._lock_config,
-                    scan_lock_config=self._scan_lock_config,
-                )
+                toggle_relay(address, on)
             )
             if result is None:
                 # Scan/connect failures are usually transient (adapter
@@ -611,11 +613,7 @@ class ShyionSwitchService:
                 )
                 time.sleep(TOGGLE_RETRY_DELAY)
                 result = self._submit_ble(
-                    toggle_relay(
-                        address, on,
-                        lock_config=self._lock_config,
-                        scan_lock_config=self._scan_lock_config,
-                    )
+                    toggle_relay(address, on)
                 )
             GLib.idle_add(self._apply_relay_result, mac_id, result)
         finally:
@@ -712,11 +710,7 @@ class ShyionSwitchService:
         try:
             address = self._device_info[mac_id].mac
             state = self._submit_ble(
-                poll_relay_state(
-                    address,
-                    lock_config=self._lock_config,
-                    scan_lock_config=self._scan_lock_config,
-                )
+                poll_relay_state(address)
             )
             GLib.idle_add(self._apply_poll_result, mac_id, state)
         finally:
@@ -812,11 +806,7 @@ class ShyionSwitchService:
         try:
             address = self._device_info[mac_id].mac
             state = self._submit_ble(
-                poll_relay_state(
-                    address,
-                    lock_config=self._lock_config,
-                    scan_lock_config=self._scan_lock_config,
-                )
+                poll_relay_state(address)
             )
         except Exception:
             logger.exception("[%s] Reconnect poll failed", mac_id)

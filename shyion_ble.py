@@ -42,7 +42,12 @@ Status values in getDeviceStatus response:
 Response to setDeviceStatus is 7 bytes on success; last byte 0x00 = OK.
 
 Connection model: transient sessions (connect, command, disconnect).
-Uses bleak-connection-manager for all BLE operations.
+
+BLE coordination comes from the bleak-connection-manager catcher, which the
+driver installs process-wide before importing this module: every BleakClient
+and BleakScanner built here is already routed through claim-aware adapter
+selection.  Nothing in this module configures adapters or locks -- it writes
+plain bleak and bleak-retry-connector code, and the catcher does the rest.
 """
 
 from __future__ import annotations
@@ -51,22 +56,29 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from bleak import BleakClient
-from bleak_retry_connector import BleakNotFoundError
-
-from bleak_connection_manager import (
-    EscalationConfig,
-    EscalationPolicy,
-    LockConfig,
-    ScanLockConfig,
+from bleak import BleakClient, BleakScanner
+from bleak_retry_connector import (
+    BleakAbortedError,
+    BleakConnectionError,
+    BleakNotFoundError,
+    BleakOutOfConnectionSlotsError,
     establish_connection,
-    discover_adapters,
-    managed_discover,
-    managed_find_device,
-    validate_char_exists,
+    get_device,
 )
 
+from bleak_connection_manager import tolerate_late_gatt, validate_char_exists
+
 logger = logging.getLogger(__name__)
+
+# Failures that mean "the relay is asleep, out of range, or every radio is
+# busy" rather than "something is broken".  Each is worth one log line and a
+# retry on the caller's backoff, never a traceback.
+BLE_UNREACHABLE = (
+    BleakNotFoundError,
+    BleakOutOfConnectionSlotsError,
+    BleakAbortedError,
+    BleakConnectionError,
+)
 
 # ── Telink SPP UUIDs ──────────────────────────────────────────────────────────
 
@@ -76,6 +88,30 @@ SPP_WRITE   = "00010203-0405-0607-0809-0a0b0c0d2b11"
 
 # BLE name prefix for BBKS relay devices
 BBKS_NAME_PREFIX = "BBKS"
+
+# ── Connection tuning ─────────────────────────────────────────────────────────
+
+# How long to scan for a relay that is not in the BlueZ cache.
+SCAN_TIMEOUT = 15.0
+
+# Connect attempts per session; bleak-retry-connector drives these, and the
+# catcher routes each one -- a failed attempt walks to the next radio.
+CONNECT_MAX_ATTEMPTS = 4
+
+# Ceiling on the whole find-and-connect phase.  Sessions run on the shared
+# asyncio loop with a worker thread blocked on the result, so a connect that
+# never returns would wedge that thread for good.
+CONNECT_OVERALL_TIMEOUT = 300.0
+
+# Post-connect validation.  A connect that reports success is not always a
+# usable link: these Telink parts announce ServicesResolved with only the
+# Generic Attribute service present and register the vendor services seconds
+# later, so a bare characteristic check would reject a link that was about to
+# become fine.  tolerate_late_gatt re-reads the GATT table from BlueZ after
+# 2s/4s/8s before giving up.  A rejection is a connection failure: the catcher
+# tears the link down, charges the adapter a failure in its placement score,
+# and bleak-retry-connector attempts again on the next radio.
+VALIDATE_SPP_LINK = tolerate_late_gatt(validate_char_exists(SPP_NOTIFY))
 
 # ── Framing constants ─────────────────────────────────────────────────────────
 
@@ -181,22 +217,14 @@ class DiscoveredRelay:
     model: str = ""
 
 
-async def scan_for_relays(
-    timeout: float = 12.0,
-    scan_lock_config: ScanLockConfig | None = None,
-) -> list[DiscoveredRelay]:
+async def scan_for_relays(timeout: float = 12.0) -> list[DiscoveredRelay]:
     """Scan BLE for BBKS relay devices.
 
-    Uses bleak-connection-manager's managed_discover for automatic
-    adapter rotation, scan locking, and InProgress retry.
+    The catcher's wrapped scanner picks the least-busy adapter, holds that
+    card's exclusive scan claim for the duration so other processes steer
+    around it, and restarts the scan on another radio if this one goes quiet.
     """
-    if scan_lock_config is None:
-        scan_lock_config = ScanLockConfig(enabled=True)
-
-    devices = await managed_discover(
-        timeout=timeout,
-        scan_lock_config=scan_lock_config,
-    )
+    devices = await BleakScanner.discover(timeout=timeout)
 
     found: dict[str, DiscoveredRelay] = {}
     for device in devices:
@@ -229,66 +257,80 @@ class ShyionSession:
 
     Usage::
 
-        async with ShyionSession(address, lock_config, scan_lock_config) as s:
+        async with ShyionSession(address) as s:
             state = await s.get_relay_state()
             confirmed = await s.set_relay(True)
     """
 
-    def __init__(
-        self,
-        address: str,
-        lock_config: LockConfig | None = None,
-        scan_lock_config: ScanLockConfig | None = None,
-    ):
+    def __init__(self, address: str):
         self._address = address
-        self._lock_config = lock_config or LockConfig(enabled=True)
-        self._scan_lock_config = scan_lock_config or ScanLockConfig(enabled=True)
         self._client: BleakClient | None = None
         self._response: bytes | None = None
         self._response_event: asyncio.Event | None = None
 
-    async def __aenter__(self) -> ShyionSession:
-        adapters = discover_adapters()
-        escalation = EscalationPolicy(adapters, config=EscalationConfig(reset_adapter=False))
+    async def _find_device(self):
+        """Resolve the address to a BLEDevice, cache first.
 
-        # Step 1: Find the device
-        logger.info("[%s] Scanning...", self._address)
-        device = await managed_find_device(
-            self._address,
-            timeout=15.0,
-            max_attempts=3,
-            scan_lock_config=self._scan_lock_config,
+        Cache-first is not just a speed optimisation here.  BBKS relays
+        advertise sparsely, so scan-based discovery misses them often; and a
+        cache-resolved BLEDevice carries its adapter in its D-Bus path, which
+        the catcher treats as caller-explicit -- claims and connection-
+        parameter tuning land on the radio the link will really use.
+        """
+        device = await get_device(self._address)
+        if device is not None:
+            return device
+
+        logger.info("[%s] Not in the BlueZ cache, scanning...", self._address)
+        return await BleakScanner.find_device_by_address(
+            self._address, timeout=SCAN_TIMEOUT
         )
 
+    async def _connect(self) -> None:
+        device = await self._find_device()
         if device is None:
-            # Same condition BCM's establish_connection reports for a device
-            # that vanishes between scan and connect -- raise the same type so
+            # Same condition bleak-retry-connector reports for a device that
+            # vanishes between scan and connect -- raise the same type so
             # callers have one "not reachable" case to handle.
             raise BleakNotFoundError(
                 f"[{self._address}] Device not found after scanning"
             )
 
-        # Step 2: Connect via BCM
         logger.info("[%s] Connecting...", self._address)
         self._client = await establish_connection(
             BleakClient,
             device,
             "Shyion %s" % self._address,
-            max_attempts=4,
-            close_inactive_connections=True,
-            try_direct_first=True,
-            validate_connection=validate_char_exists(SPP_NOTIFY),
-            lock_config=self._lock_config,
-            escalation_policy=escalation,
-            overall_timeout=300.0,
+            max_attempts=CONNECT_MAX_ATTEMPTS,
+            validate_connection=VALIDATE_SPP_LINK,
         )
 
-        logger.info("[%s] Connected (MTU: %d)", self._address, self._client.mtu_size)
+    async def __aenter__(self) -> ShyionSession:
+        # Anything that fails past this point has to tear the link down
+        # itself: __aexit__ only runs for a session that entered cleanly, and
+        # a link left up holds its adapter claim and link slot until the
+        # heartbeat reaps them.
+        try:
+            # Step 1: find and connect, under one overall budget.
+            try:
+                await asyncio.wait_for(
+                    self._connect(), timeout=CONNECT_OVERALL_TIMEOUT
+                )
+            except asyncio.TimeoutError as exc:
+                raise BleakNotFoundError(
+                    f"[{self._address}] Gave up after "
+                    f"{CONNECT_OVERALL_TIMEOUT:.0f}s trying to connect"
+                ) from exc
 
-        # Step 3: Set up notifications
-        await asyncio.wait_for(
-            self._setup_notifications(), timeout=5.0
-        )
+            logger.info(
+                "[%s] Connected (MTU: %d)", self._address, self._client.mtu_size
+            )
+
+            # Step 2: Set up notifications
+            await asyncio.wait_for(self._setup_notifications(), timeout=5.0)
+        except BaseException:
+            await self.__aexit__()
+            raise
 
         return self
 
@@ -453,22 +495,19 @@ class ShyionSession:
 
 # ── Convenience wrappers for background threads ──────────────────────────────
 
-async def poll_relay_state(
-    address: str,
-    lock_config: LockConfig | None = None,
-    scan_lock_config: ScanLockConfig | None = None,
-) -> bool | None:
+async def poll_relay_state(address: str) -> bool | None:
     """Connect, query relay state, disconnect.
 
     Returns True (ON), False (OFF), or None on failure.
-    Designed to be called via ``asyncio.run()`` from a background thread.
+    Runs on the driver's shared asyncio loop, submitted from a worker thread.
     """
     try:
-        async with ShyionSession(address, lock_config, scan_lock_config) as s:
+        async with ShyionSession(address) as s:
             return await s.get_relay_state()
-    except BleakNotFoundError as exc:
-        # Expected whenever the relay is asleep or out of range -- log a single
-        # line rather than a traceback; the caller retries with backoff.
+    except BLE_UNREACHABLE as exc:
+        # Expected whenever the relay is asleep, out of range, or every radio
+        # is busy -- log a single line rather than a traceback; the caller
+        # retries with backoff.
         logger.warning("[%s] Not reachable, will retry later: %s", address, exc)
         return None
     except Exception:
@@ -476,21 +515,16 @@ async def poll_relay_state(
         return None
 
 
-async def toggle_relay(
-    address: str,
-    on: bool,
-    lock_config: LockConfig | None = None,
-    scan_lock_config: ScanLockConfig | None = None,
-) -> bool | None:
+async def toggle_relay(address: str, on: bool) -> bool | None:
     """Connect, set relay, read back state, disconnect.
 
     Returns the confirmed relay state (True/False) or None on failure.
-    Designed to be called via ``asyncio.run()`` from a background thread.
+    Runs on the driver's shared asyncio loop, submitted from a worker thread.
     """
     try:
-        async with ShyionSession(address, lock_config, scan_lock_config) as s:
+        async with ShyionSession(address) as s:
             return await s.set_relay(on)
-    except BleakNotFoundError as exc:
+    except BLE_UNREACHABLE as exc:
         logger.warning("[%s] Not reachable, toggle not applied: %s", address, exc)
         return None
     except Exception:

@@ -15,8 +15,10 @@ control.
   OS switches pane with a discovery toggle.
 - **Relay Control** -- Toggle individual relays on/off from the Venus OS GUI,
   VRM portal, or any D-Bus client.
-- **Robust BLE Handling** -- Connect-on-demand with cross-process locking,
-  adapter rotation, phantom connection cleanup, and automatic recovery.
+- **Robust BLE Handling** -- Connect-on-demand through the bleak-connection-
+  manager catcher: claim-aware adapter selection coordinated with the other BLE
+  services on the GX, failure-driven adapter rotation, post-connect link
+  validation, and automatic recovery.
 - **Persistent State** -- Remembers discovered devices and their enabled state
   across reboots.
 - **No Cloud Dependency** -- All relay control happens over local BLE.  The
@@ -46,7 +48,7 @@ installs or external package management required:
 | `velib_python` | Victron D-Bus service helper library |
 | `bleak` | Cross-platform BLE client library |
 | `bleak-retry-connector` | Connection retry logic with exponential backoff |
-| `bleak-connection-manager` | BLE connection lifecycle manager (scan locking, adapter rotation, health checks) |
+| `bleak-connection-manager` | v2 "bleak catcher": claim-aware adapter routing installed underneath every bleak client |
 | `bluetooth-adapters` | HCI adapter enumeration |
 | `aiooui` | OUI (MAC vendor) lookups |
 
@@ -200,16 +202,19 @@ dbus-shyion-switch.py       Single-process service
   |  Per-device BLE connections in background threads
   |  Relay control via SwitchableOutput paths
   |
+  +-- shyion_bcm.py          BLE catcher wiring (installed before any bleak import)
+  |     Parses bluetooth_adapters / bluetooth_link_caps from config.ini
+  |
   +-- shyion_ble.py          BLE protocol module
   |     Telink SPP framing (XOR checksum, byte-stuffing)
   |     getDeviceStatus / setDeviceStatus commands
+  |     Cache-first device resolution, post-connect link validation
   |
-  +-- ext/bleak-connection-manager/   BLE connection lifecycle manager
-  |     Cross-process scan locking (fcntl.flock)
-  |     Cache-first scanning (BlueZ D-Bus cache before StartDiscovery)
-  |     Pre-scan adapter health checks (detects stale BlueZ state)
-  |     Adapter rotation and score-based selection
-  |     ConnectionWatchdog for dead connection detection
+  +-- ext/bleak-connection-manager/   Claim-aware BLE adapter routing (catcher)
+  |     Rebinds bleak's client and scanner process-wide
+  |     Adapter claims under /run/bt-claims, shared with the other BLE services
+  |     Failure-driven adapter walk; per-adapter link slots
+  |     Exclusive scan claim per card; quiet-scanner watchdog
   |
   +-- shyion_device.py       Standalone CLI probe tool
   |
