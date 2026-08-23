@@ -8,4 +8,11 @@ sleep 3
 
 echo "Starting Shyion relay manager..."
 cd /data/apps/dbus-shyion-switch
-exec softlimit -d 150000000 -s 2000000 -a 150000000 python3 -u dbus-shyion-switch.py
+
+# Shared BCM install: the /data/bcm shim serves the fleet-wide BLE stack and
+# marks this a deliberate consumer (BCM_AUTOWIRE=0).  A standalone install
+# without the shared checkout falls back to plain python3, which uses this
+# repo's vendored ext/ stack instead.
+BCM_PY=/data/bcm/python3
+[ -x "$BCM_PY" ] || BCM_PY=python3
+exec softlimit -d 150000000 -s 2000000 -a 150000000 "$BCM_PY" -u dbus-shyion-switch.py

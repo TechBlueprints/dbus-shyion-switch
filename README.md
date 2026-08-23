@@ -40,17 +40,22 @@ These devices use the Telink TLSR8266 BLE chipset and advertise as `BBKS-XXXX`.
 - **Git** (for cloning; the installer will install it via `opkg` if needed)
 - One or two BLE adapters available on the GX device
 
-All BLE dependencies are vendored as git submodules in `ext/` -- no pip
-installs or external package management required:
+Dependencies are vendored as git submodules in `ext/` -- no pip installs or
+external package management required:
 
 | Submodule | Purpose |
 |-----------|---------|
 | `velib_python` | Victron D-Bus service helper library |
-| `bleak` | Cross-platform BLE client library |
-| `bleak-retry-connector` | Connection retry logic with exponential backoff |
-| `bleak-connection-manager` | v2 "bleak catcher": claim-aware adapter routing installed underneath every bleak client |
-| `bluetooth-adapters` | HCI adapter enumeration |
-| `aiooui` | OUI (MAC vendor) lookups |
+| `bleak-connection-manager` | v2 "bleak catcher": claim-aware adapter routing installed underneath every bleak client. Carries the whole BLE stack -- bleak, bleak-retry-connector, dbus-fast, bluetooth-adapters, aiooui. |
+
+**On a GX device running more than one BLE service**, the driver instead uses
+the shared install at `/data/bcm` -- one git checkout of
+bleak-connection-manager that every consumer on the box shares, exec'd through
+its interpreter shim (`/data/bcm/python3`).  Sharing one stack is what lets the
+services coordinate: they see each other's adapter claims under
+`/run/bt-claims` and place connections around one another.  The installer
+converges that checkout automatically; the vendored `ext/` copy above is the
+fallback for a standalone install.
 
 ## Quick Install
 
@@ -63,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/TechBlueprints/dbus-shyion-switch/m
 The installer will:
 1. Install git if needed
 2. Clone the repository to `/data/apps/dbus-shyion-switch`
-3. Initialize all git submodules (BLE stack + velib_python)
+3. Initialize the git submodules and converge the shared BLE stack at `/data/bcm`
 4. Create the service symlink and rc.local entry
 5. Start the service
 
@@ -203,7 +208,8 @@ dbus-shyion-switch.py       Single-process service
   |  Relay control via SwitchableOutput paths
   |
   +-- shyion_bcm.py          BLE catcher wiring (installed before any bleak import)
-  |     Parses bluetooth_adapters / bluetooth_link_caps from config.ini
+  |     Parses adapters / link_caps from config.ini; resolves the BLE stack
+  |     from the /data/bcm shim, falling back to ext/
   |
   +-- shyion_ble.py          BLE protocol module
   |     Telink SPP framing (XOR checksum, byte-stuffing)

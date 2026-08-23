@@ -95,14 +95,12 @@ echo ""
 echo "Step 3: Setting up dependencies..."
 cd "$INSTALL_DIR"
 
-# Required submodules and their fallback clone URLs
+# Required submodules and their fallback clone URLs.  The BLE stack is one
+# submodule now: the bleak-connection-manager checkout carries bleak,
+# bleak-retry-connector, dbus-fast, bluetooth-adapters and aiooui itself.
 SUBMODULES="
 velib_python|https://github.com/victronenergy/velib_python.git
 bleak-connection-manager|https://github.com/TechBlueprints/bleak-connection-manager.git
-bleak-retry-connector|https://github.com/Bluetooth-Devices/bleak-retry-connector.git
-bleak|https://github.com/hbldh/bleak.git
-bluetooth-adapters|https://github.com/Bluetooth-Devices/bluetooth-adapters.git
-aiooui|https://github.com/Bluetooth-Devices/aiooui.git
 "
 
 git submodule update --init --recursive 2>/dev/null && {
@@ -122,7 +120,7 @@ git submodule update --init --recursive 2>/dev/null && {
 
 # Verify critical dependencies
 MISSING=""
-for dep in velib_python/vedbus.py bleak/bleak/__init__.py bleak-connection-manager/src/bleak_connection_manager/__init__.py bleak-retry-connector/src/bleak_retry_connector/__init__.py; do
+for dep in velib_python/vedbus.py bleak-connection-manager/src/bleak_connection_manager/__init__.py bleak-connection-manager/ext/upstream/bleak/bleak/__init__.py; do
     if [ ! -f "ext/$dep" ]; then
         MISSING="$MISSING  ext/$dep\n"
     fi
@@ -135,6 +133,31 @@ if [ -n "$MISSING" ]; then
     echo "Try: cd $INSTALL_DIR && git submodule update --init --recursive"
 else
     echo "All dependencies verified"
+fi
+echo ""
+
+# Step 3b: Converge the shared BCM install (/data/bcm)
+#
+# The fleet's BLE stack lives in one git checkout that every consumer on the
+# box shares, exec'd through its interpreter shim.  This is idempotent and
+# ff-only, so running it from a stale installer can never move the fleet
+# backwards.  Failure is not fatal: service/run falls back to plain python3
+# and this repo's vendored ext/ stack.
+echo "Step 3b: Converging shared BLE stack at /data/bcm..."
+BCM_DIR=/data/bcm
+if [ -d "$BCM_DIR/.git" ]; then
+    git -C "$BCM_DIR" fetch -q origin && git -C "$BCM_DIR" merge -q --ff-only origin/main
+else
+    git clone -q https://github.com/TechBlueprints/bleak-connection-manager "$BCM_DIR"
+fi
+if [ -x "$BCM_DIR/install.sh" ]; then
+    if "$BCM_DIR/install.sh"; then
+        echo "Shared BLE stack ready"
+    else
+        echo "WARNING: /data/bcm/install.sh failed; falling back to the vendored ext/ stack"
+    fi
+else
+    echo "WARNING: no /data/bcm/install.sh; falling back to the vendored ext/ stack"
 fi
 echo ""
 

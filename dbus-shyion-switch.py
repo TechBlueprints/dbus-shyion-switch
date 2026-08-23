@@ -49,20 +49,11 @@ import dbus
 from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
-# Add ext folders to sys.path
+# Victron's D-Bus helpers are service-specific, so they stay vendored here.
+# The BLE stack does not: shyion_bcm resolves it from the shared /data/bcm
+# shim, falling back to ext/ for a standalone checkout.
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
-
-# All BLE dependencies from local ext/ submodules (upstream repos)
-for _sub in [
-    os.path.join(_ext_dir, "bleak-connection-manager", "src"),  # bleak_connection_manager
-    os.path.join(_ext_dir, "bleak-retry-connector", "src"),     # bleak_retry_connector
-    os.path.join(_ext_dir, "bluetooth-adapters", "src"),        # bluetooth_adapters
-    os.path.join(_ext_dir, "aiooui", "src"),                    # aiooui
-    os.path.join(_ext_dir, "bleak"),                            # bleak (package at repo root)
-]:
-    if os.path.isdir(_sub) and _sub not in sys.path:
-        sys.path.insert(0, _sub)
 
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402

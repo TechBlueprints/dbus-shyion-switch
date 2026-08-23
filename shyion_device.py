@@ -31,8 +31,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
-import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,19 +38,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("shyion-device")
-
-# Run standalone, so the vendored BLE stack has to be put on sys.path here --
-# the service entry point is not involved.
-_ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
-for _sub in [
-    os.path.join(_ext_dir, "bleak-connection-manager", "src"),
-    os.path.join(_ext_dir, "bleak-retry-connector", "src"),
-    os.path.join(_ext_dir, "bluetooth-adapters", "src"),
-    os.path.join(_ext_dir, "aiooui", "src"),
-    os.path.join(_ext_dir, "bleak"),
-]:
-    if os.path.isdir(_sub) and _sub not in sys.path:
-        sys.path.insert(0, _sub)
 
 
 def _install_catcher(adapter: str) -> None:
@@ -64,7 +49,7 @@ def _install_catcher(adapter: str) -> None:
     """
     import shyion_bcm
 
-    shyion_bcm.install_connection_manager({"bluetooth_adapters": adapter or ""})
+    shyion_bcm.install_connection_manager({"adapters": adapter or ""})
 
 
 async def probe_device(mac: str, action: str) -> None:
