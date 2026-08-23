@@ -217,22 +217,27 @@ def parse_adapters(raw: str) -> list[str]:
     splits and trims.  An empty value means "every adapter the kernel
     exposes is a candidate", which is the catcher's own default.
     """
-    return [entry.strip() for entry in (raw or "").split(",") if entry.strip()]
+    # Separated by whitespace or commas or both.  The other consumers on the
+    # box write these space-separated, so comma-only splitting silently turns
+    # "MAC MAC" into one bogus entry that matches no card -- and the catcher
+    # then falls back to treating every adapter as a candidate, which is the
+    # opposite of what an allowlist is for.
+    return (raw or "").replace(",", " ").split()
 
 
 def parse_link_caps(raw: str) -> dict[str, int]:
     """Split the link_caps config value into {adapter: capacity}.
 
-    Entries have the form ``hciX:N`` with N the established-link capacity of
-    that adapter.  Malformed entries are logged and skipped rather than
-    guessed at: a wrong cap silently gates connections.
+    Entries have the form ``<adapter>:N`` with N the established-link capacity
+    of that adapter, separated by whitespace or commas.  The adapter is named
+    by MAC now, which itself contains colons, so the split is on the LAST one:
+    ``00:01:95:CC:32:F7:5`` is that card capped at 5.  Malformed entries are
+    logged and skipped rather than guessed at: a wrong cap silently gates
+    connections.
     """
     caps: dict[str, int] = {}
-    for entry in (raw or "").split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        adapter, sep, cap = entry.partition(":")
+    for entry in (raw or "").replace(",", " ").split():
+        adapter, sep, cap = entry.rpartition(":")
         adapter = adapter.strip()
         try:
             cap_value = int(cap.strip()) if sep else 0
