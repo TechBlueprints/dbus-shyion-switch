@@ -102,7 +102,7 @@ def reverse_mac(uniqueid: str) -> str:
     """Convert a Shyion uniqueid to the actual BLE MAC address.
 
     The Shyion backend stores the MAC bytes in reversed order.
-    E.g. uniqueid 'FC019E38C1A4' → BLE MAC 'A4:C1:38:9E:01:FC'.
+    E.g. uniqueid 'FFEEDDCCBBAA' → BLE MAC 'AA:BB:CC:DD:EE:FF'.
     """
     uid = uniqueid.upper().strip().replace(":", "")
     if len(uid) != 12:

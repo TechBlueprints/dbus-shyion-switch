@@ -22,7 +22,7 @@ service does, so its connects and scans take the same /run/bt-claims claims and
 coordinate with the running service rather than fighting it for a radio.
 
 Usage:
-    python3 shyion_device.py --mac A4:C1:38:9E:01:FC [--adapter hci0] [--get|--on|--off]
+    python3 shyion_device.py --mac AA:BB:CC:DD:EE:FF [--adapter hci0] [--get|--on|--off]
     python3 shyion_device.py --scan [--adapter hci0]
 """
 

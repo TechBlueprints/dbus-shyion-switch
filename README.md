@@ -130,12 +130,12 @@ name_prefixes = BBKS
 
 [Fridge_Switch]
 name = Fridge Switch
-mac = A4:C1:38:9E:01:FC
+mac = AA:BB:CC:DD:EE:FF
 model = Bluetooth Battery Kill Switch-200A
 
 [Running_Lights]
 name = Running Lights
-mac = A4:C1:38:19:62:00
+mac = AA:BB:CC:11:22:33
 model = Bluetooth Battery Kill Switch-120A
 ```
 
@@ -170,7 +170,7 @@ line:
 
 ```bash
 # Read relay state (read-only)
-python3 shyion_device.py --mac A4:C1:38:9E:01:FC --get
+python3 shyion_device.py --mac AA:BB:CC:DD:EE:FF --get
 
 # Scan for BBKS devices
 python3 shyion_device.py --scan
