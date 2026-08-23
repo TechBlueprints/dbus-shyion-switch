@@ -15,7 +15,7 @@ chmod +x "$INSTALL_DIR/service/log/run"
 
 # Verify critical submodules are present
 DEPS_OK=true
-for dep in velib_python/vedbus.py bleak-connection-manager/src/bleak_connection_manager/__init__.py; do
+for dep in velib_python/vedbus.py; do
     if [ ! -f "$INSTALL_DIR/ext/$dep" ]; then
         echo "WARNING: Missing dependency ext/$dep"
         DEPS_OK=false
@@ -24,6 +24,16 @@ done
 if [ "$DEPS_OK" = false ]; then
     echo "Attempting to initialize submodules..."
     cd "$INSTALL_DIR" && git submodule update --init --recursive 2>/dev/null || true
+fi
+
+# The BLE stack is not vendored -- it comes from the shared checkout.  Warn
+# rather than fail: enable.sh only wires up the service, and install.sh is
+# what sets the stack up (and stops if it cannot).
+BCM_DIR="${BCM_DIR:-/data/bcm}"
+if [ ! -x "$BCM_DIR/python3" ]; then
+    echo "WARNING: no shared BLE stack at $BCM_DIR (no interpreter shim)."
+    echo "         The service will not start until it exists. Run:"
+    echo "           bash $INSTALL_DIR/install.sh"
 fi
 
 # Create rc.local if it doesn't exist

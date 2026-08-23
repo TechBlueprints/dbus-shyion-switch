@@ -91,16 +91,14 @@ else
 fi
 echo ""
 
-# Step 3: Initialize all submodules (BLE stack + velib_python)
+# Step 3: Initialize submodules (service-specific deps only)
 echo "Step 3: Setting up dependencies..."
 cd "$INSTALL_DIR"
 
-# Required submodules and their fallback clone URLs.  The BLE stack is one
-# submodule now: the bleak-connection-manager checkout carries bleak,
-# bleak-retry-connector, dbus-fast, bluetooth-adapters and aiooui itself.
+# Only Victron's D-Bus helpers are vendored here.  The BLE stack deliberately
+# is not -- it comes from the shared checkout set up in step 3b.
 SUBMODULES="
 velib_python|https://github.com/victronenergy/velib_python.git
-bleak-connection-manager|https://github.com/TechBlueprints/bleak-connection-manager.git
 "
 
 git submodule update --init --recursive 2>/dev/null && {
@@ -120,7 +118,7 @@ git submodule update --init --recursive 2>/dev/null && {
 
 # Verify critical dependencies
 MISSING=""
-for dep in velib_python/vedbus.py bleak-connection-manager/src/bleak_connection_manager/__init__.py bleak-connection-manager/ext/upstream/bleak/bleak/__init__.py; do
+for dep in velib_python/vedbus.py; do
     if [ ! -f "ext/$dep" ]; then
         MISSING="$MISSING  ext/$dep\n"
     fi
@@ -136,29 +134,56 @@ else
 fi
 echo ""
 
-# Step 3b: Converge the shared BCM install (/data/bcm)
+# Step 3b: Converge the shared BLE stack (/data/bcm)
 #
-# The fleet's BLE stack lives in one git checkout that every consumer on the
-# box shares, exec'd through its interpreter shim.  This is idempotent and
-# ff-only, so running it from a stale installer can never move the fleet
-# backwards.  Failure is not fatal: service/run falls back to plain python3
-# and this repo's vendored ext/ stack.
-echo "Step 3b: Converging shared BLE stack at /data/bcm..."
-BCM_DIR=/data/bcm
+# This is where the BLE stack comes from -- bleak, bleak-retry-connector,
+# bleak-connection-manager, dbus-fast and friends -- for this service and for
+# every other BLE consumer on the box.  Nothing is vendored here, on purpose:
+# BCM keys adapter claims by adapter MAC, so a consumer on a different build
+# writes claims the rest of the fleet cannot read, and the coordination fails
+# silently.  One checkout, one version.
+#
+# Idempotent and ff-only, so running it from a stale installer can never move
+# the fleet backwards.  Rollback is `git -C /data/bcm checkout <hash> &&
+# /data/bcm/install.sh`.
+#
+# Unlike step 3 this is fatal.  There is no fallback stack to degrade to, and
+# a service that starts without BLE is worse than an install that stops and
+# says why.
+BCM_DIR="${BCM_DIR:-/data/bcm}"
+BCM_URL=https://github.com/TechBlueprints/bleak-connection-manager
+echo "Step 3b: Converging shared BLE stack at $BCM_DIR..."
+
 if [ -d "$BCM_DIR/.git" ]; then
-    git -C "$BCM_DIR" fetch -q origin && git -C "$BCM_DIR" merge -q --ff-only origin/main
+    git -C "$BCM_DIR" fetch -q origin && git -C "$BCM_DIR" merge -q --ff-only origin/main || {
+        echo "ERROR: could not fast-forward $BCM_DIR to origin/main."
+        echo "It may have local commits or be on a pinned hash. Resolve there, then re-run."
+        exit 1
+    }
 else
-    git clone -q https://github.com/TechBlueprints/bleak-connection-manager "$BCM_DIR"
+    git clone -q "$BCM_URL" "$BCM_DIR" || {
+        echo "ERROR: could not clone the shared BLE stack from $BCM_URL into $BCM_DIR."
+        exit 1
+    }
 fi
-if [ -x "$BCM_DIR/install.sh" ]; then
-    if "$BCM_DIR/install.sh"; then
-        echo "Shared BLE stack ready"
-    else
-        echo "WARNING: /data/bcm/install.sh failed; falling back to the vendored ext/ stack"
-    fi
-else
-    echo "WARNING: no /data/bcm/install.sh; falling back to the vendored ext/ stack"
+
+# Run their installer unpiped: it fetches the pinned submodules, smoke-imports
+# the stack and writes the shim, and it refuses to update the shim if that
+# import fails.  Piping it would eat the exit code.
+"$BCM_DIR/install.sh"
+BCM_RC=$?
+if [ "$BCM_RC" -ne 0 ]; then
+    echo ""
+    echo "ERROR: $BCM_DIR/install.sh failed (exit $BCM_RC)."
+    echo "The BLE stack is not usable, so this service would not start."
+    echo "Re-running is safe -- it is idempotent and resumes from partial state."
+    exit 1
 fi
+if [ ! -x "$BCM_DIR/python3" ]; then
+    echo "ERROR: $BCM_DIR/install.sh reported success but wrote no interpreter shim."
+    exit 1
+fi
+echo "Shared BLE stack ready ($(git -C "$BCM_DIR" rev-parse --short HEAD))"
 echo ""
 
 # Step 4: Run enable script

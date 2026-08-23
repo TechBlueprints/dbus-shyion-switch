@@ -22,13 +22,20 @@ it was imported.  shyion_ble imports bleak at module scope, so the driver
 calls install_connection_manager() before importing it -- which is why this
 module must not import bleak or shyion_ble at module scope itself.
 
-BLE stack resolution: on a fleet install the service/run script execs the
-shared BCM checkout's interpreter shim (/data/bcm/python3), which serves
-bleak, bleak-retry-connector, bleak-connection-manager, dbus-fast and friends
-to every consumer on the box.  A standalone checkout (bare clone, plain
-python3) gets the same stack from this repo's vendored ext/ submodules
-instead.  _ensure_ble_stack() prefers whatever the interpreter already
-provides and only falls back to ext/.
+BLE stack resolution: this repo vendors no BLE libraries at all.  The whole
+stack -- bleak, bleak-retry-connector, bleak-connection-manager, dbus-fast,
+bluetooth-adapters, aiooui -- comes from the shared BCM checkout that every
+consumer on the box shares, which install.sh converges and whose own
+installer builds the interpreter shim service/run execs.
+
+Vendoring a second copy would defeat the point: BCM keys adapter claims by
+adapter MAC, and a consumer running a different build can write claims the
+rest of the fleet cannot read -- silently, with no error.  One checkout, one
+version, or the coordination stops working.
+
+_ensure_ble_stack() therefore prefers whatever the interpreter already
+provides (the shim, normally) and otherwise resolves the shared checkout
+directly, so hand-run CLI tools work under a plain python3 too.
 """
 
 from __future__ import annotations
@@ -40,15 +47,34 @@ import sys
 logger = logging.getLogger(__name__)
 
 
-def _ensure_ble_stack() -> None:
-    """Put the vendored ext/ BLE stack on sys.path unless already provided
-    (by the shared /data/bcm shim, or by test stubs).
+# The shared BCM checkout.  BCM_ROOT is the canary knob its own shim honours
+# -- point one service at a second checkout to trial a version without moving
+# the fleet -- so respect it here too, or a hand-run CLI would silently probe
+# a different build than the service it is meant to be debugging.
+BCM_ROOT = os.environ.get("BCM_ROOT", "/data/bcm")
 
-    The vendored bleak-connection-manager checkout carries the whole stack:
-    its own src/, the libraries it vendors (dbus_fast, bluetooth_adapters,
-    aiooui) under ext/, and bleak plus bleak-retry-connector as submodules
-    under ext/upstream/.  This repo therefore vendors one BLE submodule, not
-    six.
+
+def _bcm_lib_paths(root: str) -> list[str]:
+    """The paths the BCM shim exports as PYTHONPATH, in its order.
+
+    Mirrors `/data/bcm/python3`; keep in step with it if that layout moves.
+    """
+    return [
+        os.path.join(root, "src"),
+        os.path.join(root, "ext"),
+        os.path.join(root, "ext", "upstream", "bleak"),
+        os.path.join(root, "ext", "upstream", "bleak-retry-connector", "src"),
+    ]
+
+
+def _ensure_ble_stack() -> None:
+    """Make the shared BLE stack importable, if it is not already.
+
+    Normally a no-op: the service runs under the shim, which has already put
+    the stack on PYTHONPATH.  The fallback exists for CLI tools run by hand
+    under a plain python3 -- resolving the shared checkout ourselves rather
+    than vendoring a copy, so those tools exercise the same build the service
+    does.
     """
     if "bleak_connection_manager" in sys.modules:
         return
@@ -58,21 +84,23 @@ def _ensure_ble_stack() -> None:
             return
     except (ImportError, ValueError):
         # A stub with __spec__ = None makes find_spec raise ValueError; any
-        # odd interpreter state degrades to "insert the ext paths", which is
-        # the safe direction -- worst case the vendored copy shadows the
-        # shim, never running with no stack at all.
+        # odd interpreter state degrades to "add the shared paths", which is
+        # the safe direction -- worst case a redundant sys.path entry.
         pass
-    _bcm = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "ext", "bleak-connection-manager"
-    )
-    for _sub in [
-        os.path.join(_bcm, "src"),
-        os.path.join(_bcm, "ext"),
-        os.path.join(_bcm, "ext", "upstream", "bleak"),
-        os.path.join(_bcm, "ext", "upstream", "bleak-retry-connector", "src"),
-    ]:
-        if os.path.isdir(_sub) and _sub not in sys.path:
-            sys.path.insert(0, _sub)
+
+    found = [p for p in _bcm_lib_paths(BCM_ROOT) if os.path.isdir(p)]
+    if not found:
+        raise ImportError(
+            f"The shared BLE stack is not installed at {BCM_ROOT}. "
+            f"Install it with:  git clone "
+            f"https://github.com/TechBlueprints/bleak-connection-manager "
+            f"{BCM_ROOT} && {BCM_ROOT}/install.sh   "
+            f"(or re-run this project's install.sh, which does it for you). "
+            f"Set BCM_ROOT to use a checkout elsewhere."
+        )
+    for path in reversed(found):
+        if path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def parse_adapters(raw: str) -> list[str]:

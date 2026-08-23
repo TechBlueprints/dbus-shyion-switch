@@ -40,22 +40,30 @@ These devices use the Telink TLSR8266 BLE chipset and advertise as `BBKS-XXXX`.
 - **Git** (for cloning; the installer will install it via `opkg` if needed)
 - One or two BLE adapters available on the GX device
 
-Dependencies are vendored as git submodules in `ext/` -- no pip installs or
-external package management required:
+Only Victron's D-Bus helper library is vendored here, as a git submodule in
+`ext/`:
 
 | Submodule | Purpose |
 |-----------|---------|
 | `velib_python` | Victron D-Bus service helper library |
-| `bleak-connection-manager` | v2 "bleak catcher": claim-aware adapter routing installed underneath every bleak client. Carries the whole BLE stack -- bleak, bleak-retry-connector, dbus-fast, bluetooth-adapters, aiooui. |
 
-**On a GX device running more than one BLE service**, the driver instead uses
-the shared install at `/data/bcm` -- one git checkout of
-bleak-connection-manager that every consumer on the box shares, exec'd through
-its interpreter shim (`/data/bcm/python3`).  Sharing one stack is what lets the
-services coordinate: they see each other's adapter claims under
-`/run/bt-claims` and place connections around one another.  The installer
-converges that checkout automatically; the vendored `ext/` copy above is the
-fallback for a standalone install.
+**The BLE stack is deliberately not vendored.**  It comes from
+[bleak-connection-manager](https://github.com/TechBlueprints/bleak-connection-manager),
+installed once at `/data/bcm` as a single git checkout that every BLE service
+on the box shares and runs through its interpreter shim (`/data/bcm/python3`).
+That checkout carries bleak, bleak-retry-connector, dbus-fast,
+bluetooth-adapters and aiooui, so there is still nothing to pip install --
+`install.sh` sets it up by calling the project's own installer.
+
+Sharing one copy is not a convenience, it is what makes the coordination work.
+The library keys adapter claims by adapter MAC, so a service running a
+different build writes claims under names the rest of the fleet cannot read --
+and it fails silently, with no error, just services placing connections on top
+of each other.  One checkout, one version, or the coordination stops working.
+This is why the repo pins no version of it.
+
+To trial a different build without moving the fleet, point one service at a
+second checkout with `BCM_ROOT=/path/to/checkout` in its run script.
 
 ## Quick Install
 
@@ -68,7 +76,7 @@ curl -fsSL https://raw.githubusercontent.com/TechBlueprints/dbus-shyion-switch/m
 The installer will:
 1. Install git if needed
 2. Clone the repository to `/data/apps/dbus-shyion-switch`
-3. Initialize the git submodules and converge the shared BLE stack at `/data/bcm`
+3. Initialize the git submodule and install the shared BLE stack at `/data/bcm` (by running its own installer)
 4. Create the service symlink and rc.local entry
 5. Start the service
 
@@ -209,14 +217,14 @@ dbus-shyion-switch.py       Single-process service
   |
   +-- shyion_bcm.py          BLE catcher wiring (installed before any bleak import)
   |     Parses adapters / link_caps from config.ini; resolves the BLE stack
-  |     from the /data/bcm shim, falling back to ext/
+  |     from the shared checkout (BCM_ROOT, default /data/bcm)
   |
   +-- shyion_ble.py          BLE protocol module
   |     Telink SPP framing (XOR checksum, byte-stuffing)
   |     getDeviceStatus / setDeviceStatus commands
   |     Cache-first device resolution, post-connect link validation
   |
-  +-- ext/bleak-connection-manager/   Claim-aware BLE adapter routing (catcher)
+  +-- /data/bcm/  (shared, not vendored)  Claim-aware BLE adapter routing
   |     Rebinds bleak's client and scanner process-wide
   |     Adapter claims under /run/bt-claims, shared with the other BLE services
   |     Failure-driven adapter walk; per-adapter link slots

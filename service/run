@@ -9,10 +9,17 @@ sleep 3
 echo "Starting Shyion relay manager..."
 cd /data/apps/dbus-shyion-switch
 
-# Shared BCM install: the /data/bcm shim serves the fleet-wide BLE stack and
-# marks this a deliberate consumer (BCM_AUTOWIRE=0).  A standalone install
-# without the shared checkout falls back to plain python3, which uses this
-# repo's vendored ext/ stack instead.
-BCM_PY=/data/bcm/python3
-[ -x "$BCM_PY" ] || BCM_PY=python3
+# The shared BCM checkout serves the fleet-wide BLE stack and marks this a
+# deliberate consumer (BCM_AUTOWIRE=0).  Nothing is vendored in this repo, so
+# the shim is the stack -- if it is missing, say so plainly rather than
+# starting under a python3 that cannot import bleak and failing obscurely.
+# shyion_bcm resolves BCM_ROOT itself, so the fallback still works when the
+# stack is installed somewhere other than /data/bcm.
+BCM_PY="${BCM_ROOT:-/data/bcm}/python3"
+if [ ! -x "$BCM_PY" ]; then
+    echo "WARNING: no BLE stack shim at $BCM_PY -- run install.sh."
+    echo "         Falling back to plain python3; startup will fail unless the"
+    echo "         stack is importable some other way."
+    BCM_PY=python3
+fi
 exec softlimit -d 150000000 -s 2000000 -a 150000000 "$BCM_PY" -u dbus-shyion-switch.py
