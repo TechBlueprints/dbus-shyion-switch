@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,111 @@ def _ensure_ble_stack() -> None:
             sys.path.insert(0, path)
 
 
+_HCI_RE = re.compile(r"^hci\d+$")
+
+
+def _resolve_to_mac(name: str) -> str | None:
+    """`hciN` -> its card's MAC in `AA:BB:CC:DD:EE:FF` form, or None.
+
+    None means "leave this entry alone": the card is absent, dead (all-zeros),
+    or unidentifiable on this kernel.  Guessing would be worse than keeping a
+    stale name -- an hciN that resolves to nothing today may be a card that is
+    merely unplugged.
+    """
+    if not _HCI_RE.match(name):
+        return None
+    try:
+        _ensure_ble_stack()
+        from bleak_connection_manager import claims
+    except Exception:
+        logger.debug("claims module unavailable; cannot resolve %s", name,
+                     exc_info=True)
+        return None
+    mac = claims.adapter_mac(name)
+    if not mac or mac == claims.UNKNOWN_MAC:
+        return None
+    return mac.upper()
+
+
+def normalize_adapter_entry(entry: str) -> str:
+    """Rewrite one adapters entry so the adapter is named by MAC.
+
+    Handles both forms the catcher accepts: a bare adapter (`hci3`) and a
+    device pin (`AA:BB:..@hci3`), whose suffix is an adapter reference too.
+    Entries already naming a MAC pass through untouched.
+    """
+    device, sep, adapter = entry.rpartition("@")
+    target = adapter if sep else entry
+    resolved = _resolve_to_mac(target)
+    if resolved is None:
+        return entry
+    return f"{device}@{resolved}" if sep else resolved
+
+
+def normalize_config_adapters(config_path: str) -> bool:
+    """Rewrite `adapters` in config.ini so cards are named by MAC, not hciN.
+
+    hciN numbering is not an identity: a USB reset, a replug or a reboot
+    renumbers cards, and a numeric pin then silently points at a different
+    radio.  On a box where adapters are deliberately allocated between
+    services -- one card reserved for a BMS link, another for scanning --
+    getting that backwards means connecting on the card we promised to leave
+    alone.  So the config is corrected in place the first time we see it,
+    rather than re-resolved forever at every use.
+
+    Rewrites the line textually rather than via configparser, which would
+    discard every comment in the file.  Returns whether anything changed.
+    """
+    try:
+        with open(config_path) as handle:
+            lines = handle.readlines()
+    except OSError:
+        logger.debug("cannot read %s to normalize adapters", config_path,
+                     exc_info=True)
+        return False
+
+    changed = False
+    for i, line in enumerate(lines):
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "adapters" or line.lstrip().startswith("#"):
+            continue
+        entries = value.replace(",", " ").split()
+        rewritten = [normalize_adapter_entry(e) for e in entries]
+        if rewritten == entries:
+            continue
+        for before, after in zip(entries, rewritten):
+            if before != after:
+                logger.warning(
+                    "config.ini: adapter %s is a name, not an identity -- "
+                    "rewriting to %s (hciN numbering moves on reset/replug/reboot)",
+                    before, after,
+                )
+        lines[i] = f"{key}= {' '.join(rewritten)}\n"
+        changed = True
+
+    if not changed:
+        return False
+
+    # Write via a temp file in the same directory then rename, so a crash or a
+    # full disk cannot leave the service with a truncated config.
+    tmp = f"{config_path}.tmp"
+    try:
+        with open(tmp, "w") as handle:
+            handle.writelines(lines)
+        os.replace(tmp, config_path)
+    except OSError:
+        logger.exception("could not rewrite %s; continuing with the values as read",
+                         config_path)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+    logger.info("config.ini: adapters normalized to MAC identities")
+    return True
+
+
 def parse_adapters(raw: str) -> list[str]:
     """Split the adapters config value into catcher entries.
 
@@ -141,16 +247,26 @@ def parse_link_caps(raw: str) -> dict[str, int]:
     return caps
 
 
-def install_connection_manager(defaults) -> bool:
+def install_connection_manager(defaults, config_path: str | None = None) -> bool:
     """Install the bleak catcher for this process.
 
     ``defaults`` is the config's DEFAULT section (anything with .get).
+    ``config_path``, when given, is normalized in place first so any hciN
+    adapter names become MAC identities -- and the values used here are the
+    corrected ones, not the stale names.
 
     Returns True when the catcher was installed.  A failed install is logged
     and swallowed: the catcher is coordination, and connecting uncoordinated
     beats not connecting at all.
     """
-    adapters = parse_adapters(defaults.get("adapters", ""))
+    raw_adapters = defaults.get("adapters", "")
+    if config_path and normalize_config_adapters(config_path):
+        # Re-resolve rather than re-reading the file: the section handed to us
+        # is already parsed, and the same translation gives the same answer.
+        raw_adapters = " ".join(
+            normalize_adapter_entry(e) for e in raw_adapters.replace(",", " ").split()
+        )
+    adapters = parse_adapters(raw_adapters)
     link_caps = parse_link_caps(defaults.get("link_caps", ""))
 
     try:

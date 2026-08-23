@@ -140,8 +140,13 @@ def get_device_configs(config: configparser.ConfigParser) -> dict[str, dict[str,
 # scope, so the install has to happen here, between reading the config and
 # importing it.
 _CONFIG = load_config()
+# Only ever normalize the live config.ini.  config.default.ini ships in git
+# with empty values, and rewriting it would put this box's adapter MACs into
+# a tracked file.
+_CONFIG_INI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 shyion_bcm.install_connection_manager(
-    _CONFIG["DEFAULT"] if "DEFAULT" in _CONFIG else {}
+    _CONFIG["DEFAULT"] if "DEFAULT" in _CONFIG else {},
+    config_path=_CONFIG_INI if os.path.exists(_CONFIG_INI) else None,
 )
 
 from shyion_ble import (  # noqa: E402
