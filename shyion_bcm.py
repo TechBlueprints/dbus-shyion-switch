@@ -33,9 +33,11 @@ adapter MAC, and a consumer running a different build can write claims the
 rest of the fleet cannot read -- silently, with no error.  One checkout, one
 version, or the coordination stops working.
 
-_ensure_ble_stack() therefore prefers whatever the interpreter already
-provides (the shim, normally) and otherwise resolves the shared checkout
-directly, so hand-run CLI tools work under a plain python3 too.
+The stack is sourced IN PROCESS, per the fleet consumer contract: the folder
+is configuration, nothing about how the process was launched has any say, and
+bleak_connection_manager is imported before anything imports bleak -- which is
+also what stands the sitewide autowire hook down for us.  There is no
+interpreter shim any more.
 """
 
 from __future__ import annotations
@@ -48,60 +50,75 @@ import sys
 logger = logging.getLogger(__name__)
 
 
-# The shared BCM checkout.  BCM_ROOT is the canary knob its own shim honours
-# -- point one service at a second checkout to trial a version without moving
-# the fleet -- so respect it here too, or a hand-run CLI would silently probe
-# a different build than the service it is meant to be debugging.
-BCM_ROOT = os.environ.get("BCM_ROOT", "/data/bcm")
+# Where the shared bleak-connection-manager install lives.  One key, per the
+# fleet consumer contract (CONSUMERS.md section 2): config.ini decides, an
+# EMPTY value means never look (a deliberate standalone run), and nothing
+# about how the process was launched has any say -- no interpreter shim, no
+# PYTHONPATH, no environment contract.  Pointing this key at a second checkout
+# is the canary knob; there is deliberately no environment override, because
+# an env var would be exactly the launch-time influence the contract removes.
+DEFAULT_BCM_DIR = "/data/bcm"
+
+# StartNotify policy, also consumer-side and defaulting on.  AcquireNotify is
+# the only path that creates the notify_io BlueZ 5.72 double-frees, and
+# bleak's own default is moving toward AcquireNotify -- so this is the guard
+# against a library flip, not a preference.
+DEFAULT_FORCE_START_NOTIFY = True
+
+_logged_once = set()
 
 
-def _bcm_lib_paths(root: str) -> list[str]:
-    """The paths the BCM shim exports as PYTHONPATH, in its order.
-
-    Mirrors `/data/bcm/python3`; keep in step with it if that layout moves.
-    """
-    return [
-        os.path.join(root, "src"),
-        os.path.join(root, "ext"),
-        os.path.join(root, "ext", "upstream", "bleak"),
-        os.path.join(root, "ext", "upstream", "bleak-retry-connector", "src"),
-    ]
-
-
-def _ensure_ble_stack() -> None:
-    """Make the shared BLE stack importable, if it is not already.
-
-    Normally a no-op: the service runs under the shim, which has already put
-    the stack on PYTHONPATH.  The fallback exists for CLI tools run by hand
-    under a plain python3 -- resolving the shared checkout ourselves rather
-    than vendoring a copy, so those tools exercise the same build the service
-    does.
-    """
-    if "bleak_connection_manager" in sys.modules:
+def _log_once(level, message):
+    """The startup lines are contract text the fleet monitor greps for, and
+    each must appear at most once per process life."""
+    if message in _logged_once:
         return
-    try:
-        import importlib.util
-        if importlib.util.find_spec("bleak_connection_manager") is not None:
-            return
-    except (ImportError, ValueError):
-        # A stub with __spec__ = None makes find_spec raise ValueError; any
-        # odd interpreter state degrades to "add the shared paths", which is
-        # the safe direction -- worst case a redundant sys.path entry.
-        pass
+    _logged_once.add(message)
+    logger.log(level, message)
 
-    found = [p for p in _bcm_lib_paths(BCM_ROOT) if os.path.isdir(p)]
-    if not found:
-        raise ImportError(
-            f"The shared BLE stack is not installed at {BCM_ROOT}. "
-            f"Install it with:  git clone "
-            f"https://github.com/TechBlueprints/bleak-connection-manager "
-            f"{BCM_ROOT} && {BCM_ROOT}/install.sh   "
-            f"(or re-run this project's install.sh, which does it for you). "
-            f"Set BCM_ROOT to use a checkout elsewhere."
+
+def _ensure_ble_stack(shared_dir):
+    """Resolve the shared BLE stack and emit the contract's startup lines.
+
+    Returns True when the connection manager is importable.  Delegates the
+    mechanics to ble_stack.ensure_ble_stack(), which is lifted verbatim from
+    the fleet reference so the pinned drift test against the installer's own
+    layout covers this consumer too.  vendored_dir is None: this repo carries
+    no BLE stack, so "no shared install" means plain bleak or nothing.
+    """
+    import ble_stack
+
+    state = ble_stack.ensure_ble_stack(shared_dir or "", vendored_dir=None)
+
+    if state == "shared" or state == "provided":
+        try:
+            import bleak_connection_manager
+            served_from = os.path.dirname(
+                os.path.abspath(bleak_connection_manager.__file__)
+            )
+        except Exception:
+            served_from = shared_dir
+        # The package's OWN directory, not the configured key: with a canary
+        # checkout the two differ, and only the former is the truth.
+        _log_once(
+            logging.INFO,
+            f"BLE coordination: bleak_connection_manager loaded from {served_from}",
         )
-    for path in reversed(found):
-        if path not in sys.path:
-            sys.path.insert(0, path)
+        return True
+
+    if ble_stack.shared_failure is not None:
+        _log_once(
+            logging.ERROR,
+            f"BLE coordination: shared install at {shared_dir} is present but "
+            f"unusable, running uncoordinated: {ble_stack.shared_failure}",
+        )
+    else:
+        _log_once(
+            logging.WARNING,
+            f"BLE coordination: no shared install at {shared_dir}; running "
+            f"uncoordinated, no claims, no adapter routing, no card recovery",
+        )
+    return False
 
 
 _HCI_RE = re.compile(r"^hci\d+$")
@@ -118,7 +135,7 @@ def _resolve_to_mac(name: str) -> str | None:
     if not _HCI_RE.match(name):
         return None
     try:
-        _ensure_ble_stack()
+        _ensure_ble_stack(DEFAULT_BCM_DIR)
         from bleak_connection_manager import claims
     except Exception:
         logger.debug("claims module unavailable; cannot resolve %s", name,
@@ -209,6 +226,21 @@ def normalize_config_adapters(config_path: str) -> bool:
     return True
 
 
+def _as_bool(raw: str, default: bool) -> bool:
+    """Config booleans, permissive about spelling; blank means the default."""
+    text = (raw or "").strip().lower()
+    if not text:
+        return default
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    logger.warning(
+        "Ignoring unrecognised force_start_notify value %r; using %s", raw, default
+    )
+    return default
+
+
 def parse_adapters(raw: str) -> list[str]:
     """Split the adapters config value into catcher entries.
 
@@ -274,12 +306,22 @@ def install_connection_manager(defaults, config_path: str | None = None) -> bool
     adapters = parse_adapters(raw_adapters)
     link_caps = parse_link_caps(defaults.get("link_caps", ""))
 
+    shared_dir = defaults.get(
+        "bluetooth_connection_manager_dir", DEFAULT_BCM_DIR
+    ).strip()
+    force = _as_bool(
+        defaults.get("force_start_notify", ""), DEFAULT_FORCE_START_NOTIFY
+    )
+
+    if not _ensure_ble_stack(shared_dir):
+        return False
+
     try:
-        _ensure_ble_stack()
+        import inspect
+
         from bleak_connection_manager import install_bleak_catcher
 
-        install_bleak_catcher(
-            "dbus-shyion-switch",
+        kwargs = dict(
             adapters=adapters,
             link_caps=link_caps,
             # This driver scans for relays, so its scans must take the
@@ -287,15 +329,36 @@ def install_connection_manager(defaults, config_path: str | None = None) -> bool
             # BLE services on this GX away from the radio we are scanning on.
             wrap_scanner=True,
         )
-    except Exception:
-        logger.exception(
-            "Failed to install the BLE connection manager, "
-            "continuing without adapter coordination"
+        if "force_start_notify" in inspect.signature(install_bleak_catcher).parameters:
+            kwargs["force_start_notify"] = force
+        else:
+            # Pre-159536a install: the parameter does not exist yet, so the
+            # policy has to go through the legacy environment path instead.
+            os.environ["BCM_FORCE_START_NOTIFY"] = "true" if force else "false"
+            _log_once(
+                logging.WARNING,
+                f"BLE coordination: shared install at {shared_dir} predates the "
+                f"force_start_notify parameter; StartNotify policy passed "
+                f"through the legacy BCM_FORCE_START_NOTIFY environment",
+            )
+
+        install_bleak_catcher("dbus-shyion-switch", **kwargs)
+    except Exception as exc:
+        # The import worked but the catcher refused: the operator action is to
+        # fix the driver or the catcher, not the install, which is why this is
+        # distinct from "present but unusable".  Uncoordinated still beats not
+        # connecting at all, so this is reported, not raised.
+        _log_once(
+            logging.ERROR,
+            f"BLE coordination: catcher would not install from {shared_dir}, "
+            f"running uncoordinated: {exc!r}",
         )
         return False
 
-    logger.info(
-        "BLE connection manager installed (adapters=%s, link_caps=%s)",
-        adapters or "auto", link_caps or "uncapped",
+    pinned = sum(1 for entry in adapters if "@" in entry)
+    _log_once(
+        logging.INFO,
+        f"BLE coordination: catcher installed (force_start_notify={force}, "
+        f"adapters={len(adapters)} configured, {pinned} pinned)",
     )
     return True
