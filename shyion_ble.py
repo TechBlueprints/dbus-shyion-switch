@@ -111,7 +111,35 @@ CONNECT_OVERALL_TIMEOUT = 300.0
 # 2s/4s/8s before giving up.  A rejection is a connection failure: the catcher
 # tears the link down, charges the adapter a failure in its placement score,
 # and bleak-retry-connector attempts again on the next radio.
-VALIDATE_SPP_LINK = tolerate_late_gatt(validate_char_exists(SPP_NOTIFY))
+#
+# BOTH characteristics are required, not just the notify one.  Field
+# 2026-09-09: a link passed validation on 2b10, subscribed notifications, and
+# then the first write raised BleakCharacteristicNotFoundError for 2b11 -- the
+# table had registered the notify characteristic but not yet the write one.
+# Validating half the interface we use turned a retryable late-GATT case into
+# a hard mid-session failure.  BCM's built-ins each check one thing, so the
+# composition is ours.
+
+
+def _all_of(*validators):
+    """A validator that passes only when every given validator passes.
+
+    Each built-in already catches its own exceptions and answers False, so a
+    plain conjunction is safe -- and short-circuiting on the first False keeps
+    the late-GATT retry loop cheap when the table is still empty.
+    """
+    async def _validator(client):
+        for validate in validators:
+            if not await validate(client):
+                return False
+        return True
+    _validator.__doc__ = f"All of: {[getattr(v, '__doc__', '') for v in validators]}"
+    return _validator
+
+
+VALIDATE_SPP_LINK = tolerate_late_gatt(
+    _all_of(validate_char_exists(SPP_NOTIFY), validate_char_exists(SPP_WRITE))
+)
 
 # ── Framing constants ─────────────────────────────────────────────────────────
 
