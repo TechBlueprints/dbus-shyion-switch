@@ -144,9 +144,15 @@ _CONFIG = load_config()
 # with empty values, and rewriting it would put this box's adapter MACs into
 # a tracked file.
 _CONFIG_INI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+# The connect allowlist starts as config.ini's devices.  Devices adopted by an
+# earlier discovery live in /Settings and cannot be read here -- D-Bus is not
+# up yet -- so they are added after the restore, which is also the only place
+# the permitted set is allowed to grow.
+_DEVICE_CONFIGS = get_device_configs(_CONFIG)
 shyion_bcm.install_connection_manager(
     _CONFIG["DEFAULT"] if "DEFAULT" in _CONFIG else {},
     config_path=_CONFIG_INI if os.path.exists(_CONFIG_INI) else None,
+    allowed_devices=list(_DEVICE_CONFIGS.keys()),
 )
 
 from shyion_ble import (  # noqa: E402
@@ -184,7 +190,7 @@ class ShyionSwitchService:
         self._name_prefixes = [p.strip() for p in prefix_config.split(",") if p.strip()]
 
         # Pre-configured devices from config.ini
-        self._device_configs = get_device_configs(self._config)
+        self._device_configs = _DEVICE_CONFIGS
         logger.info("Configured devices: %d", len(self._device_configs))
         logger.info("Scan interval: %ds", self._scan_interval)
         logger.info("State poll interval: %.0f min", self._poll_interval_minutes)
@@ -954,6 +960,13 @@ class ShyionSwitchService:
 
             if restored > 0:
                 logger.info("Restored %d device(s) from settings", restored)
+
+            # Devices restored from settings are stored configuration too, so
+            # they belong in the connect allowlist -- but only these, and the
+            # widening is logged.
+            shyion_bcm.extend_allowed_devices(
+                d.mac for d in self._device_info.values()
+            )
 
         except dbus.exceptions.DBusException:
             logger.debug("No saved devices to restore (fresh install)")

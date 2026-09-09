@@ -284,7 +284,46 @@ def parse_link_caps(raw: str) -> dict[str, int]:
     return caps
 
 
-def install_connection_manager(defaults, config_path: str | None = None) -> bool:
+_install_state = {}
+
+
+def extend_allowed_devices(macs) -> None:
+    """Widen the connect allowlist to include devices restored from settings.
+
+    The catcher installs at module scope, before D-Bus exists, so only
+    config.ini's devices are known then.  Devices adopted by an earlier
+    discovery live in /Settings and only surface once the service is up --
+    they ARE stored configuration, so they belong in the allowlist, but the
+    widening is logged because it is the one path by which the permitted set
+    grows beyond the config file.
+    """
+    if not _install_state.get("installed"):
+        return
+    allowed = _install_state.get("allowed")
+    if allowed is None:
+        return  # no gate configured; nothing to widen
+    new = sorted({m.strip().upper() for m in macs if m} - set(allowed))
+    if not new:
+        return
+    logger.warning(
+        "BLE coordination: allowing %d device(s) restored from settings that "
+        "are not in config.ini: %s", len(new), ", ".join(new),
+    )
+    _install_state["allowed"] = sorted(set(allowed) | set(new))
+    try:
+        from bleak_connection_manager import install_bleak_catcher
+
+        install_bleak_catcher(
+            _install_state["owner"],
+            allowed_devices=_install_state["allowed"],
+            **_install_state["kwargs"],
+        )
+    except Exception as exc:
+        logger.error("Could not widen the connect allowlist: %r", exc)
+
+
+def install_connection_manager(defaults, config_path: str | None = None,
+                               allowed_devices=None) -> bool:
     """Install the bleak catcher for this process.
 
     ``defaults`` is the config's DEFAULT section (anything with .get).
@@ -342,7 +381,23 @@ def install_connection_manager(defaults, config_path: str | None = None) -> bool
                 f"through the legacy BCM_FORCE_START_NOTIFY environment",
             )
 
+        allowed = None
+        if allowed_devices is not None and "allowed_devices" in inspect.signature(
+            install_bleak_catcher
+        ).parameters:
+            # The peer set is bounded by STORED configuration, never by radio
+            # range: seeing an advertisement is not a reason to connect.  A
+            # connect to anything else raises DeviceNotPermitted before a claim
+            # is taken.
+            allowed = sorted({m.strip().upper() for m in allowed_devices if m})
+            kwargs["allowed_devices"] = allowed
+
         install_bleak_catcher("dbus-shyion-switch", **kwargs)
+        _install_state.update(
+            installed=True, owner="dbus-shyion-switch",
+            allowed=allowed, kwargs=dict(kwargs),
+        )
+        _install_state["kwargs"].pop("allowed_devices", None)
     except Exception as exc:
         # The import worked but the catcher refused: the operator action is to
         # fix the driver or the catcher, not the install, which is why this is
@@ -361,4 +416,10 @@ def install_connection_manager(defaults, config_path: str | None = None) -> bool
         f"BLE coordination: catcher installed (force_start_notify={force}, "
         f"adapters={len(adapters)} configured, {pinned} pinned)",
     )
+    if _install_state.get("allowed") is not None:
+        _log_once(
+            logging.INFO,
+            f"BLE coordination: connect allowlist active, "
+            f"{len(_install_state['allowed'])} device(s) permitted",
+        )
     return True
