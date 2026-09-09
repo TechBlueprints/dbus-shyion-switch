@@ -50,8 +50,8 @@ from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 # Victron's D-Bus helpers are service-specific, so they stay vendored here.
-# The BLE stack does not: shyion_bcm resolves it from the shared /data/bcm
-# shim, falling back to ext/ for a standalone checkout.
+# The BLE stack does not: shyion_bcm sources it in process from the folder
+# named in config.ini, per the fleet consumer contract.
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 
@@ -686,14 +686,37 @@ class ShyionSwitchService:
         return True
 
     def _run_poll_all_devices(self):
-        """Background thread: poll each device sequentially (one at a time)."""
-        for mac_id in list(self._device_info.keys()):
-            self._run_poll_device(mac_id)
+        """Background thread: poll each device sequentially (one at a time).
+
+        Emits ONE summary line per sweep.  A healthy poll is otherwise silent
+        (the per-session lifecycle is DEBUG), but the reachable/total series is
+        kept at INFO deliberately: it is what lets an outage be reconstructed
+        from the log afterwards, and a relay that stays OFF while unreachable
+        is indistinguishable from a healthy one without it.
+        """
+        macs = list(self._device_info.keys())
+        unreachable = []
+        for mac_id in macs:
+            if self._run_poll_device(mac_id) is None:
+                unreachable.append(self._get_device_name(mac_id))
+
+        reached = len(macs) - len(unreachable)
+        if unreachable:
+            logger.info(
+                "Poll sweep: %d/%d reachable; no answer from %s",
+                reached, len(macs), ", ".join(unreachable),
+            )
+        else:
+            logger.info("Poll sweep: %d/%d reachable", reached, len(macs))
 
     def _run_poll_device(self, mac_id: str):
-        """Transient session: connect, query state, disconnect."""
+        """Transient session: connect, query state, disconnect.
+
+        Returns the relay state, or None if it could not be read -- the sweep
+        summary counts those rather than each poll logging its own success.
+        """
         if mac_id not in self._device_info:
-            return
+            return None
 
         lock = self._device_ble_lock.get(mac_id)
         if lock is not None and not lock.acquire(blocking=False):
@@ -701,7 +724,7 @@ class ShyionSwitchService:
                 "Poll skipped for %s: BLE session already in progress",
                 self._get_device_name(mac_id),
             )
-            return
+            return None
 
         try:
             address = self._device_info[mac_id].mac
@@ -709,6 +732,7 @@ class ShyionSwitchService:
                 poll_relay_state(address)
             )
             GLib.idle_add(self._apply_poll_result, mac_id, state)
+            return state
         finally:
             if lock is not None:
                 lock.release()

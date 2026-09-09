@@ -281,7 +281,7 @@ class ShyionSession:
         if device is not None:
             return device
 
-        logger.info("[%s] Not in the BlueZ cache, scanning...", self._address)
+        logger.debug("[%s] Not in the BlueZ cache, scanning...", self._address)
         return await BleakScanner.find_device_by_address(
             self._address, timeout=SCAN_TIMEOUT
         )
@@ -296,7 +296,7 @@ class ShyionSession:
                 f"[{self._address}] Device not found after scanning"
             )
 
-        logger.info("[%s] Connecting...", self._address)
+        logger.debug("[%s] Connecting...", self._address)
         self._client = await establish_connection(
             BleakClient,
             device,
@@ -322,7 +322,7 @@ class ShyionSession:
                     f"{CONNECT_OVERALL_TIMEOUT:.0f}s trying to connect"
                 ) from exc
 
-            logger.info(
+            logger.debug(
                 "[%s] Connected (MTU: %d)", self._address, self._client.mtu_size
             )
 
@@ -442,7 +442,11 @@ class ShyionSession:
         if (len(resp) >= 7 and resp[0] == 0x20
                 and resp[3] == 0x20 and resp[4] == 0x02):
             on = bool(resp[6])
-            logger.info(
+            # Per-poll state is DEBUG: the driver logs a state CHANGE at
+            # INFO and a per-sweep availability summary, which is the signal
+            # that mattered when diagnosing an outage -- 28 identical lines an
+            # hour were not.
+            logger.debug(
                 "[%s] Relay state: %s", self._address, "ON" if on else "OFF"
             )
             return on
