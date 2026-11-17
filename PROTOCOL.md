@@ -11,14 +11,25 @@ through GATT writes and notifications.
 
 ## Supported Models
 
-| Model | Amperage |
-|-------|----------|
-| Bluetooth Battery Kill Switch-120A | 120A |
-| Bluetooth Battery Kill Switch-200A | 200A |
-| Bluetooth Battery Kill Switch-250A | 250A |
+| Model | Amperage | Device type code | Advertised name |
+|-------|----------|------------------|-----------------|
+| Bluetooth Battery Kill Switch-120A | 120A | 10 | `BBKS-2023-120A` |
+| Bluetooth Battery Kill Switch-200A | 200A | 8 | `BBKS-2023-200A` |
+| Bluetooth Battery Kill Switch-250A | 250A | 11 | `BBKS-2023-250A` |
 
-All models use the same BLE protocol. They advertise with names matching the
-pattern `BBKS-XXXX-NNA` (e.g. `BBKS-2023-200A`).
+All models use the same BLE protocol. Each model carries a numeric type code
+(above) that determines its `BBKS-2023-NNNA` name. A device does not have to
+be found by name: scanning unfiltered and identifying by type code also
+works. Matching on a `BBKS` name prefix, as this driver does, is a
+convenience that holds because the devices advertise a `BBKS-…` name; it is
+not something the protocol requires. Only the `2023` model year has been
+seen.
+
+The type code is the first thing to check if a device with a different
+advertised name does not respond as described here: the relay command header
+(see Command Format) is specific to this device family, and other Shyion
+products (for example the temperature/humidity sensors) use a different value
+in header byte 3.
 
 ## BLE GATT Profile
 
@@ -45,10 +56,14 @@ Before the device will send notification responses, the Client Characteristic
 Configuration Descriptor (CCCD, UUID `0x2902`) on the Notify characteristic
 (`2b10`) must be set to `0x0100` (notifications enabled).
 
-Most BLE stacks handle this automatically when subscribing to notifications,
-but these devices may persist CCCD state incorrectly. If notifications are not
-received after subscribing, manually read the CCCD descriptor and write
-`0x01 0x00` if it reads `0x00 0x00`.
+Most BLE stacks handle this automatically when subscribing to notifications;
+a single standard enable-notification write of `0x0100` is all the protocol
+calls for.
+
+*Troubleshooting note (field experience, not part of the protocol):* if
+notifications are not received after subscribing, reading the CCCD and
+writing `0x01 0x00` when it reads `0x00 0x00` has been used as a workaround
+for a stack that did not apply the write.
 
 ## Frame Format
 
@@ -236,7 +251,8 @@ Responses arrive as BLE notifications within 1-2 seconds. A timeout of
 
 ## Connection Sequence
 
-1. **Scan** for BLE devices with names starting with `BBKS`
+1. **Scan** for BLE devices with names starting with `BBKS` (or identify them
+   by type code, see Supported Models)
 2. **Connect** via GATT (no pairing required)
 3. **Subscribe to notifications** on the SPP Notify characteristic (`2b10`)
    — see CCCD note above if notifications are not received
@@ -249,6 +265,14 @@ Responses arrive as BLE notifications within 1-2 seconds. A timeout of
 
 If the device becomes unresponsive to SPP commands, it can be recovered
 without a physical power cycle using the Telink OTA service.
+
+**Status of this section:** the OTA PDU *format* below (layout, little-endian
+index and CRC, CRC16 over the first 18 bytes) is the standard firmware-update
+framing for these devices. The *recovery procedure* itself (three all-`0xFF`
+PDUs, then disconnect, then a watchdog reboot) is an empirical technique, not
+a documented device behavior: nothing in the normal update flow reboots the
+device this way, and a real update sends as many PDUs as the firmware image
+needs. Confirm it on the device in hand before depending on it.
 
 ### Symptoms of a stuck device
 
